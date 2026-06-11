@@ -5,6 +5,7 @@
 //   - Proper message sequence: system + history, no single-message packing
 //   - Spinner during LLM wait, tool call display during execution
 //   - Shell context (cwd, last cmd, exit code) injected into system prompt each turn
+//   - Active context slots (from /ctx) injected into system prompt
 //   - Loop-breaker: max rounds + repeated-identical-call detection
 package agent
 
@@ -17,15 +18,29 @@ import (
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
-const (
-	maxRounds = 15
+const maxRounds = 15
 
-	baseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
-You help users accomplish tasks using shell commands and your own knowledge.
-You have a bash tool and other utility tools. Use them to get things done.
-Be concise. Show relevant command output. Prefer doing over explaining.
-If the user asks something you can answer directly, do so without calling tools.`
-)
+const baseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
+Help the user accomplish tasks using shell commands and your own knowledge.
+Be concise. Show relevant output. Prefer doing over explaining.
+Use tools when needed; answer directly when you can.`
+
+// LoopConfig holds tuneable parameters for the agent loop.
+type LoopConfig struct {
+	MaxHistoryMessages int    // number of messages to keep in context (default 20)
+	ToolOutputMaxChars int    // truncate/summarize tool results above this (default 4000)
+	ToolOverflow       string // "truncate" or "summarize"
+	CtxMaxInjectChars  int    // max chars to inject per context slot (default 8000)
+}
+
+func defaultLoopConfig() LoopConfig {
+	return LoopConfig{
+		MaxHistoryMessages: 20,
+		ToolOutputMaxChars: 4000,
+		ToolOverflow:       "truncate",
+		CtxMaxInjectChars:  8000,
+	}
+}
 
 // ShellContext holds the current state of the shell, injected into the agent
 // system prompt so the AI has accurate context for each turn.
@@ -33,24 +48,26 @@ type ShellContext struct {
 	CWD          string
 	LastCommand  string
 	LastExitCode int
-	LastStderr   string // captured stderr on non-zero exit, for "?why" style queries
+	LastStderr   string
 }
 
 // Loop is a stateful, multi-turn agent. One instance persists across user turns
 // so conversation history is maintained for the session.
 type Loop struct {
-	provider llm.ToolCallingProvider
-	tools    []llm.ToolDef
-	handlers map[string]func(map[string]interface{}) (string, error)
-	history  []llm.ChatMessage
-	shellCtx ShellContext
+	provider     llm.ToolCallingProvider
+	tools        []llm.ToolDef
+	handlers     map[string]func(map[string]interface{}) (string, error)
+	history      []llm.ChatMessage
+	shellCtx     ShellContext
+	contextSlots map[string]string
+	cfg          LoopConfig
 
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
 	OnToolResult func(name string, result string)
 }
 
-// New creates a new agent loop.
+// New creates a new agent loop with default configuration.
 func New(
 	provider llm.ToolCallingProvider,
 	tools []llm.ToolDef,
@@ -61,13 +78,30 @@ func New(
 		tools:    tools,
 		handlers: handlers,
 		history:  make([]llm.ChatMessage, 0, 32),
+		cfg:      defaultLoopConfig(),
 	}
 }
 
-// SetShellContext updates the shell state that is injected into every LLM call.
-// Call this before Run() each turn so the agent always has current state.
-func (l *Loop) SetShellContext(ctx ShellContext) {
-	l.shellCtx = ctx
+// SetShellContext updates the shell state injected into every LLM call.
+func (l *Loop) SetShellContext(ctx ShellContext) { l.shellCtx = ctx }
+
+// SetContextSlots updates named context content injected into the system prompt.
+func (l *Loop) SetContextSlots(slots map[string]string) { l.contextSlots = slots }
+
+// SetConfig updates tuneable loop parameters.
+func (l *Loop) SetConfig(cfg LoopConfig) {
+	if cfg.MaxHistoryMessages > 0 {
+		l.cfg.MaxHistoryMessages = cfg.MaxHistoryMessages
+	}
+	if cfg.ToolOutputMaxChars > 0 {
+		l.cfg.ToolOutputMaxChars = cfg.ToolOutputMaxChars
+	}
+	if cfg.ToolOverflow != "" {
+		l.cfg.ToolOverflow = cfg.ToolOverflow
+	}
+	if cfg.CtxMaxInjectChars > 0 {
+		l.cfg.CtxMaxInjectChars = cfg.CtxMaxInjectChars
+	}
 }
 
 // SetTools replaces the tool list (called when functions are reloaded).
@@ -127,7 +161,6 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 				sig := callSig{tc.Name, fmt.Sprint(tc.Args)}
 				recentCalls[sig]++
 				if recentCalls[sig] >= 3 {
-					// Stuck in a loop — force a final answer.
 					l.history = append(l.history, llm.ChatMessage{
 						Role:    "user",
 						Content: "You appear to be repeating the same tool call. Please give your best answer based on what you have so far.",
@@ -139,7 +172,7 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 					l.OnToolCall(tc.Name, tc.Args)
 				}
 
-				result := l.executeTool(tc)
+				result := l.executeTool(ctx, tc)
 
 				if l.OnToolResult != nil {
 					l.OnToolResult(tc.Name, result)
@@ -153,7 +186,7 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 				})
 			}
 
-			sp = newSpinner() // spinner for next round
+			sp = newSpinner()
 			continue
 		}
 
@@ -189,6 +222,16 @@ func (l *Loop) ToolNames() []string {
 
 func (l *Loop) buildMessages() []llm.ChatMessage {
 	sys := baseSystemPrompt
+
+	// Dynamic tool list.
+	if len(l.tools) > 0 {
+		sys += "\n\nAvailable tools:"
+		for _, t := range l.tools {
+			sys += fmt.Sprintf("\n- %s: %s", t.Name, t.Description)
+		}
+	}
+
+	// Shell state.
 	if c := l.shellCtx; c.CWD != "" {
 		sys += fmt.Sprintf("\n\nShell state:\n  cwd: %s", c.CWD)
 		if c.LastCommand != "" {
@@ -204,12 +247,35 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 		}
 	}
 
-	msgs := make([]llm.ChatMessage, 0, 1+len(l.history))
+	// Active context slots — capped to CtxMaxInjectChars per slot.
+	if len(l.contextSlots) > 0 {
+		sys += "\n\nActive context:"
+		for name, content := range l.contextSlots {
+			cap := l.cfg.CtxMaxInjectChars
+			if cap > 0 && len(content) > cap {
+				sys += fmt.Sprintf("\n--- %s (%d chars total, showing first %d) ---\n%s\n[... truncated]",
+					name, len(content), cap, content[:cap])
+			} else {
+				sys += fmt.Sprintf("\n--- %s (%d chars) ---\n%s", name, len(content), content)
+			}
+		}
+	}
+
+	// Trim history to configured window, aligning to a user-message boundary.
+	hist := l.history
+	if max := l.cfg.MaxHistoryMessages; max > 0 && len(hist) > max {
+		hist = hist[len(hist)-max:]
+		for len(hist) > 0 && hist[0].Role != "user" {
+			hist = hist[1:]
+		}
+	}
+
+	msgs := make([]llm.ChatMessage, 0, 1+len(hist))
 	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
-	return append(msgs, l.history...)
+	return append(msgs, hist...)
 }
 
-func (l *Loop) executeTool(tc llm.ToolCall) string {
+func (l *Loop) executeTool(ctx context.Context, tc llm.ToolCall) string {
 	handler, ok := l.handlers[tc.Name]
 	if !ok {
 		return fmt.Sprintf("error: unknown tool %q", tc.Name)
@@ -221,7 +287,40 @@ func (l *Loop) executeTool(tc llm.ToolCall) string {
 	if strings.TrimSpace(result) == "" {
 		return "(no output)"
 	}
+
+	// Handle large results.
+	if l.cfg.ToolOutputMaxChars > 0 && len(result) > l.cfg.ToolOutputMaxChars {
+		if l.cfg.ToolOverflow == "summarize" {
+			if summarized, err := l.summarizeLarge(ctx, tc.Name, result); err == nil {
+				return summarized
+			}
+		}
+		// Default: truncate.
+		return result[:l.cfg.ToolOutputMaxChars] +
+			fmt.Sprintf("\n... [truncated — %d chars total]", len(result))
+	}
+
 	return result
+}
+
+// summarizeLarge calls the LLM to compress a large tool result before storing
+// it in history. Falls back to truncation on error.
+func (l *Loop) summarizeLarge(ctx context.Context, toolName, content string) (string, error) {
+	cap := 20000
+	if len(content) < cap {
+		cap = len(content)
+	}
+	prompt := fmt.Sprintf(
+		"Summarize the following output from the '%s' tool in 3-5 sentences, preserving key facts, numbers, errors, and file paths:\n\n%s",
+		toolName, content[:cap],
+	)
+	opts := llm.DefaultOptions().WithMaxTokens(300).WithTemperature(0.2)
+	ch := l.provider.Ainvoke(ctx, prompt, opts)
+	resp, err := llm.CollectResponse(ctx, ch)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("[summarized from %d chars]\n%s", len(content), resp.Text), nil
 }
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
@@ -249,7 +348,7 @@ func (s *spinner) run() {
 	for {
 		select {
 		case <-s.stopCh:
-			fmt.Print("\r\033[K") // clear spinner line
+			fmt.Print("\r\033[K")
 			return
 		case <-tick.C:
 			fmt.Printf("\r\033[2m%s\033[0m", frames[i%len(frames)])
@@ -261,7 +360,6 @@ func (s *spinner) run() {
 func (s *spinner) stop() {
 	select {
 	case <-s.stopCh:
-		// already stopped
 	default:
 		close(s.stopCh)
 		<-s.doneCh
