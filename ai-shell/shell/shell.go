@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/chzyer/readline"
 	"github.com/pvjammer/ai-shell-poc/agent"
@@ -33,7 +35,9 @@ type Shell struct {
 	appCfg   config.Config
 	rl       *readline.Instance
 	agent    *agent.Loop
+	agentMu  sync.Mutex
 	fnLoader *functions.Loader
+	jobs     *jobManager
 
 	ctxSlots     map[string]string
 	lastCmd      string
@@ -77,7 +81,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	completer := NewHybridCompleter(append(metaCommands(), fnLoader.Names()...))
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            buildPrompt(),
+		Prompt:            buildPrompt(nil),
 		HistoryFile:       filepath.Join(os.Getenv("HOME"), ".ai_shell_history"),
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
@@ -99,6 +103,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		rl:       rl,
 		agent:    agentLoop,
 		fnLoader: fnLoader,
+		jobs:     newJobManager(),
 		ctxSlots: ctxSlots,
 	}, nil
 }
@@ -115,12 +120,23 @@ func (s *Shell) Run() error {
 	fmt.Println()
 
 	for {
-		s.rl.SetPrompt(buildPrompt())
+		// Drain notifications from completed background jobs.
+		for _, msg := range s.jobs.drain() {
+			fmt.Println(msg)
+		}
+		s.rl.SetPrompt(buildPrompt(s.jobs))
 
 		line, err := s.rl.Readline()
 		if err != nil {
 			fmt.Println("exit")
 			break
+		}
+
+		// Detect trailing & for background execution.
+		line = strings.TrimSpace(line)
+		background := strings.HasSuffix(line, "&")
+		if background {
+			line = strings.TrimSpace(strings.TrimSuffix(line, "&"))
 		}
 
 		in := Parse(line)
@@ -129,23 +145,35 @@ func (s *Shell) Run() error {
 		}
 
 		if os.Getenv("BAISH_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "[debug] parsed: type=%d content=%q pipeLeft=%q\n",
-				in.Type, in.Content, in.PipeLeft)
+			fmt.Fprintf(os.Stderr, "[debug] parsed: type=%d content=%q pipeLeft=%q background=%v\n",
+				in.Type, in.Content, in.PipeLeft, background)
 		}
 
 		s.syncAgentContext()
 
 		switch in.Type {
 		case InputDirect:
-			s.runDirect(in.Content)
+			if background {
+				s.runDirectBackground(in.Content)
+			} else {
+				s.runDirect(in.Content)
+			}
 		case InputAgent:
-			s.runAgent(in.Content)
+			if background {
+				s.runAgentBackground(in.Content)
+			} else {
+				s.runAgent(in.Content)
+			}
 		case InputMeta:
 			if s.runMeta(in.Content) {
 				return nil
 			}
 		case InputPipeline:
-			s.runPipeline(in.PipeLeft, in.PipeRight)
+			if background {
+				s.runPipelineBackground(in.PipeLeft, in.PipeRight)
+			} else {
+				s.runPipeline(in.PipeLeft, in.PipeRight)
+			}
 		}
 	}
 	return nil
@@ -213,6 +241,9 @@ func (s *Shell) runDirect(cmdStr string) {
 
 // runAgent sends the message to the AI and streams its response.
 func (s *Shell) runAgent(msg string) {
+	s.agentMu.Lock()
+	defer s.agentMu.Unlock()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -231,6 +262,102 @@ func (s *Shell) runAgent(msg string) {
 	if err != nil && err != context.Canceled {
 		fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
 	}
+}
+
+// runAgentCapture runs the agent and returns the full response as a string.
+// Used by background agent jobs.
+func (s *Shell) runAgentCapture(ctx context.Context, msg string) (string, error) {
+	s.agentMu.Lock()
+	defer s.agentMu.Unlock()
+	var buf strings.Builder
+	err := s.agent.Run(ctx, msg, func(token string) { buf.WriteString(token) })
+	return strings.TrimSpace(buf.String()), err
+}
+
+// runDirectBackground runs a bash command in the background, capturing output.
+func (s *Shell) runDirectBackground(cmd string) {
+	display := truncateDisplay(cmd, 40)
+	id := s.jobs.start(display, func() (string, error) {
+		c := exec.Command("sh", "-c", cmd)
+		var out bytes.Buffer
+		c.Stdout = &out
+		c.Stderr = &out
+		err := c.Run()
+		return strings.TrimSpace(out.String()), err
+	})
+	fmt.Printf("[%d] started: %s\n", id, display)
+}
+
+// runAgentBackground sends the message to the agent as a background job.
+func (s *Shell) runAgentBackground(msg string) {
+	display := "?" + truncateDisplay(msg, 37)
+	s.syncAgentContext()
+	id := s.jobs.start(display, func() (string, error) {
+		return s.runAgentCapture(context.Background(), msg)
+	})
+	fmt.Printf("[%d] started: %s\n", id, display)
+}
+
+// runPipelineBackground runs a pipeline (bash | /fn or bash | ?msg) as a background job.
+func (s *Shell) runPipelineBackground(leftCmd string, right *ParsedInput) {
+	display := truncateDisplay(leftCmd+" | "+rightDisplay(right), 40)
+	s.syncAgentContext()
+	id := s.jobs.start(display, func() (string, error) {
+		c := exec.Command("sh", "-c", leftCmd)
+		var outBuf bytes.Buffer
+		c.Stdout = &outBuf
+		c.Stderr = os.Stderr
+		if err := c.Run(); err != nil {
+			if outBuf.Len() == 0 {
+				return "", err
+			}
+		}
+		return s.applyRightCapture(context.Background(), outBuf.String(), right)
+	})
+	fmt.Printf("[%d] started: %s\n", id, display)
+}
+
+// applyRightCapture is the capture-mode version of applyRight — returns output
+// as a string instead of printing it. Used by background pipeline jobs.
+func (s *Shell) applyRightCapture(ctx context.Context, content string, right *ParsedInput) (string, error) {
+	if right == nil {
+		return "", nil
+	}
+	switch right.Type {
+	case InputMeta:
+		parts := splitWords(right.Content)
+		if len(parts) == 0 {
+			return "", nil
+		}
+		if parts[0] == "ctx" {
+			s.runCtx(parts[1:], content)
+			return fmt.Sprintf("stored in ctx (%d chars)", len(strings.TrimSpace(content))), nil
+		}
+		return s.fnLoader.ExecuteWithStdin(ctx, parts[0], content, parts[1:])
+
+	case InputPipeline:
+		metaParsed := Parse(right.PipeLeft)
+		if metaParsed.Type != InputMeta {
+			return "", fmt.Errorf("expected /function, got %q", right.PipeLeft)
+		}
+		parts := splitWords(metaParsed.Content)
+		if len(parts) == 0 {
+			return "", nil
+		}
+		intermediate, err := s.fnLoader.ExecuteWithStdin(ctx, parts[0], content, parts[1:])
+		if err != nil {
+			return "", err
+		}
+		return s.applyRightCapture(ctx, intermediate, right.PipeRight)
+
+	case InputAgent:
+		msg := strings.TrimSpace(content)
+		if q := strings.TrimSpace(right.Content); q != "" {
+			msg = msg + "\n\n" + q
+		}
+		return s.runAgentCapture(ctx, msg)
+	}
+	return "", nil
 }
 
 // runMeta handles /commands. Returns true if the shell should exit.
@@ -271,6 +398,9 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 
 	case "history":
 		fmt.Printf("messages in context: %d\n", s.agent.HistoryLen())
+
+	case "jobs", "job":
+		s.runJobs(args)
 
 	case "permissions", "perm":
 		s.runPermissions(args)
@@ -464,7 +594,8 @@ func (s *Shell) printHelp() {
 	fmt.Println("  ls, vim, git status, cd .., ...   — normal shell")
 	fmt.Println()
 	fmt.Println("AI:")
-	fmt.Println("  ?<text>      ask the AI (agent can run commands for you)")
+	fmt.Println("  ?<text>        ask the AI (agent can run commands for you)")
+	fmt.Println("  ?<text> &      run in background; see /jobs when done")
 	fmt.Println()
 	fmt.Println("AI functions (slash commands):")
 	for _, name := range s.fnLoader.Names() {
@@ -478,6 +609,8 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /ctx list          list all context slots")
 	fmt.Println("  /ctx clear [name]  remove one slot or all")
 	fmt.Println("  /config            show or change settings")
+	fmt.Println("  /jobs              list background jobs")
+	fmt.Println("  /job <N>           show output of job N")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model")
@@ -592,6 +725,55 @@ func (s *Shell) applyRight(ctx context.Context, content string, right *ParsedInp
 	}
 }
 
+// runJobs handles /jobs (list all) and /job N (show output of job N).
+func (s *Shell) runJobs(args []string) {
+	if len(args) >= 1 {
+		id, err := strconv.Atoi(args[0])
+		if err == nil {
+			j := s.jobs.get(id)
+			if j == nil {
+				fmt.Fprintf(os.Stderr, "jobs: no job %d\n", id)
+				return
+			}
+			switch j.status {
+			case jobRunning:
+				fmt.Printf("[%d] still running (%.1fs)\n", j.id, time.Since(j.startedAt).Seconds())
+			case jobFailed:
+				fmt.Printf("[%d] failed: %v\n", j.id, j.err)
+			case jobDone:
+				if j.output != "" {
+					fmt.Println(j.output)
+				} else {
+					fmt.Printf("[%d] done (no output)\n", j.id)
+				}
+			}
+			return
+		}
+	}
+
+	jobs := s.jobs.list()
+	if len(jobs) == 0 {
+		fmt.Println("(no jobs)")
+		return
+	}
+	fmt.Println()
+	for _, j := range jobs {
+		switch j.status {
+		case jobRunning:
+			fmt.Printf("  %2d  \033[33mrunning\033[0m  %5.1fs  %s\n",
+				j.id, time.Since(j.startedAt).Seconds(), j.display)
+		case jobDone:
+			fmt.Printf("  %2d  \033[32mdone\033[0m     %5.1fs  %s%s\n",
+				j.id, j.elapsed.Seconds(), j.display, sizeLabel(len(j.output)))
+		case jobFailed:
+			fmt.Printf("  %2d  \033[31mfailed\033[0m   %5.1fs  %s  (%v)\n",
+				j.id, j.elapsed.Seconds(), j.display, j.err)
+		}
+	}
+	fmt.Println()
+	s.jobs.markRead()
+}
+
 // runPermissions handles /permissions — shows the tier for one or more commands.
 func (s *Shell) runPermissions(args []string) {
 	if len(args) == 0 {
@@ -648,7 +830,7 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func buildPrompt() string {
+func buildPrompt(jobs *jobManager) string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "?"
@@ -656,7 +838,43 @@ func buildPrompt() string {
 	if home := os.Getenv("HOME"); home != "" {
 		cwd = strings.Replace(cwd, home, "~", 1)
 	}
-	return fmt.Sprintf("\033[32m%s\033[0m $ ", cwd)
+	var indicator string
+	if jobs != nil {
+		running, done := jobs.activity()
+		switch {
+		case running > 0 && done > 0:
+			indicator = fmt.Sprintf(" \033[2m[%d⋯ %d✓]\033[0m", running, done)
+		case running > 0:
+			indicator = fmt.Sprintf(" \033[2m[%d⋯]\033[0m", running)
+		case done > 0:
+			indicator = fmt.Sprintf(" \033[33m[%d✓]\033[0m", done)
+		}
+	}
+	return fmt.Sprintf("\033[32m%s\033[0m%s $ ", cwd, indicator)
+}
+
+// truncateDisplay shortens a command string for display in job listings.
+func truncateDisplay(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
+// rightDisplay returns a short display string for the right side of a pipeline.
+func rightDisplay(right *ParsedInput) string {
+	if right == nil {
+		return ""
+	}
+	switch right.Type {
+	case InputAgent:
+		return "?" + right.Content
+	case InputMeta:
+		return "/" + right.Content
+	case InputPipeline:
+		return "/" + right.PipeLeft + " | " + rightDisplay(right.PipeRight)
+	}
+	return right.Content
 }
 
 func parseCd(cmd string) (string, bool) {
@@ -768,5 +986,5 @@ func wordWrap(text string, width int) []string {
 }
 
 func metaCommands() []string {
-	return []string{"help", "tools", "clear", "ctx", "config", "permissions", "model", "history", "exit"}
+	return []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "exit"}
 }
