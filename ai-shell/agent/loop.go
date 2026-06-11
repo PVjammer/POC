@@ -1,17 +1,18 @@
 // Package agent implements a clean multi-turn agent loop using native tool calling.
 //
 // Design:
-//   - Uses ChatWithTools (non-streaming) for all rounds so tool call args are complete
+//   - Uses ChatWithTools (non-streaming) for all rounds; tool call args must be complete
 //   - Proper message sequence: system + history, no single-message packing
-//   - Tool calls: append assistant msg (with calls) + tool result msgs, then loop
-//   - Text response: stream via onToken callback, append to history, done
-//   - Loop-breaker: max rounds + repeated-call detection
+//   - Spinner during LLM wait, tool call display during execution
+//   - Shell context (cwd, last cmd, exit code) injected into system prompt each turn
+//   - Loop-breaker: max rounds + repeated-identical-call detection
 package agent
 
 import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
@@ -19,25 +20,33 @@ import (
 const (
 	maxRounds = 15
 
-	systemPrompt = `You are an AI shell assistant running inside a Unix terminal.
+	baseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
 You help users accomplish tasks using shell commands and your own knowledge.
-You have a bash tool. Use it to execute commands, read files, check system state, etc.
-Be concise. When you run commands, show the relevant output. Prefer doing over explaining.
-If the user asks a question you can answer directly, do so without using bash.`
+You have a bash tool and other utility tools. Use them to get things done.
+Be concise. Show relevant command output. Prefer doing over explaining.
+If the user asks something you can answer directly, do so without calling tools.`
 )
 
-// Loop is a stateful, multi-turn agent. One Loop instance persists across
-// multiple user turns so conversation history is maintained.
+// ShellContext holds the current state of the shell, injected into the agent
+// system prompt so the AI has accurate context for each turn.
+type ShellContext struct {
+	CWD          string
+	LastCommand  string
+	LastExitCode int
+	LastStderr   string // captured stderr on non-zero exit, for "?why" style queries
+}
+
+// Loop is a stateful, multi-turn agent. One instance persists across user turns
+// so conversation history is maintained for the session.
 type Loop struct {
 	provider llm.ToolCallingProvider
 	tools    []llm.ToolDef
 	handlers map[string]func(map[string]interface{}) (string, error)
 	history  []llm.ChatMessage
+	shellCtx ShellContext
 
-	// onToolCall is called before each tool execution so the shell can print
-	// a status line. Receives the tool name and args.
-	OnToolCall func(name string, args map[string]interface{})
-	// onToolResult is called after each tool execution with the result.
+	// Callbacks for the shell to display tool activity.
+	OnToolCall   func(name string, args map[string]interface{})
 	OnToolResult func(name string, result string)
 }
 
@@ -55,8 +64,20 @@ func New(
 	}
 }
 
-// Run executes one user turn (possibly many agent rounds).
-// onToken is called with each text token of the final response.
+// SetShellContext updates the shell state that is injected into every LLM call.
+// Call this before Run() each turn so the agent always has current state.
+func (l *Loop) SetShellContext(ctx ShellContext) {
+	l.shellCtx = ctx
+}
+
+// SetTools replaces the tool list (called when functions are reloaded).
+func (l *Loop) SetTools(tools []llm.ToolDef, handlers map[string]func(map[string]interface{}) (string, error)) {
+	l.tools = tools
+	l.handlers = handlers
+}
+
+// Run executes one user turn — potentially many agent rounds.
+// onToken is called with each piece of the final text response.
 func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) error {
 	l.history = append(l.history, llm.ChatMessage{
 		Role:    "user",
@@ -65,26 +86,30 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 
 	opts := &llm.CompletionOptions{
 		MaxTokens:   4096,
-		Temperature: 0.3, // lower = more reliable tool use
+		Temperature: 0.3,
 	}
 
-	// Track recent tool calls to detect infinite loops.
 	type callSig struct{ name, args string }
 	recentCalls := make(map[callSig]int)
 
+	sp := newSpinner()
+
 	for round := 0; round < maxRounds; round++ {
 		if ctx.Err() != nil {
+			sp.stop()
 			return ctx.Err()
 		}
 
 		msgs := l.buildMessages()
 		ch := l.provider.ChatWithTools(ctx, msgs, l.tools, opts)
 
-		// Drain the channel — ChatWithTools sends one final chunk.
+		// Drain — ChatWithTools emits one final chunk.
 		var final llm.StreamChunk
 		for chunk := range ch {
 			final = chunk
 		}
+
+		sp.stop()
 
 		if final.Error != nil {
 			return fmt.Errorf("llm: %w", final.Error)
@@ -92,30 +117,30 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 
 		// ── Tool calls ────────────────────────────────────────────────────
 		if len(final.ToolCalls) > 0 {
-			// Append the assistant turn that requested the calls.
 			l.history = append(l.history, llm.ChatMessage{
 				Role:      "assistant",
-				Content:   final.Text, // may be empty, that's fine
+				Content:   final.Text,
 				ToolCalls: final.ToolCalls,
 			})
 
 			for _, tc := range final.ToolCalls {
-				// Loop-breaker: same tool + args called 3 times → bail.
 				sig := callSig{tc.Name, fmt.Sprint(tc.Args)}
 				recentCalls[sig]++
 				if recentCalls[sig] >= 3 {
+					// Stuck in a loop — force a final answer.
 					l.history = append(l.history, llm.ChatMessage{
 						Role:    "user",
-						Content: "You appear to be stuck in a loop. Please give a final answer based on what you know so far.",
+						Content: "You appear to be repeating the same tool call. Please give your best answer based on what you have so far.",
 					})
 					break
 				}
 
-				result := l.executeTool(tc)
-
 				if l.OnToolCall != nil {
 					l.OnToolCall(tc.Name, tc.Args)
 				}
+
+				result := l.executeTool(tc)
+
 				if l.OnToolResult != nil {
 					l.OnToolResult(tc.Name, result)
 				}
@@ -127,15 +152,14 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 					ToolName:   tc.Name,
 				})
 			}
-			continue // next round
+
+			sp = newSpinner() // spinner for next round
+			continue
 		}
 
 		// ── Text response ─────────────────────────────────────────────────
 		if final.Text != "" {
-			// Deliver full text via the callback.
-			// TODO: add streaming path when ChatWithTools supports it.
 			onToken(final.Text)
-
 			l.history = append(l.history, llm.ChatMessage{
 				Role:    "assistant",
 				Content: final.Text,
@@ -149,19 +173,39 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 }
 
 // ClearHistory resets conversation context.
-func (l *Loop) ClearHistory() {
-	l.history = l.history[:0]
-}
+func (l *Loop) ClearHistory() { l.history = l.history[:0] }
 
-// HistoryLen returns the number of messages in the current session.
+// HistoryLen returns the current number of messages in context.
 func (l *Loop) HistoryLen() int { return len(l.history) }
 
+// ToolNames returns the names of all tools available to the agent.
+func (l *Loop) ToolNames() []string {
+	names := make([]string, len(l.tools))
+	for i, t := range l.tools {
+		names[i] = t.Name
+	}
+	return names
+}
+
 func (l *Loop) buildMessages() []llm.ChatMessage {
+	sys := baseSystemPrompt
+	if c := l.shellCtx; c.CWD != "" {
+		sys += fmt.Sprintf("\n\nShell state:\n  cwd: %s", c.CWD)
+		if c.LastCommand != "" {
+			sys += fmt.Sprintf("\n  last command: %s", c.LastCommand)
+			sys += fmt.Sprintf("\n  exit code: %d", c.LastExitCode)
+			if c.LastExitCode != 0 && c.LastStderr != "" {
+				truncated := c.LastStderr
+				if len(truncated) > 500 {
+					truncated = truncated[:500] + "..."
+				}
+				sys += fmt.Sprintf("\n  stderr: %s", truncated)
+			}
+		}
+	}
+
 	msgs := make([]llm.ChatMessage, 0, 1+len(l.history))
-	msgs = append(msgs, llm.ChatMessage{
-		Role:    "system",
-		Content: systemPrompt,
-	})
+	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
 	return append(msgs, l.history...)
 }
 
@@ -172,10 +216,54 @@ func (l *Loop) executeTool(tc llm.ToolCall) string {
 	}
 	result, err := handler(tc.Args)
 	if err != nil {
-		return fmt.Sprintf("error executing %s: %v", tc.Name, err)
+		return fmt.Sprintf("error: %v", err)
 	}
 	if strings.TrimSpace(result) == "" {
 		return "(no output)"
 	}
 	return result
+}
+
+// ── Spinner ───────────────────────────────────────────────────────────────────
+
+type spinner struct {
+	stopCh chan struct{}
+	doneCh chan struct{}
+}
+
+func newSpinner() *spinner {
+	s := &spinner{
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+	go s.run()
+	return s
+}
+
+func (s *spinner) run() {
+	defer close(s.doneCh)
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	tick := time.NewTicker(80 * time.Millisecond)
+	defer tick.Stop()
+	i := 0
+	for {
+		select {
+		case <-s.stopCh:
+			fmt.Print("\r\033[K") // clear spinner line
+			return
+		case <-tick.C:
+			fmt.Printf("\r\033[2m%s\033[0m", frames[i%len(frames)])
+			i++
+		}
+	}
+}
+
+func (s *spinner) stop() {
+	select {
+	case <-s.stopCh:
+		// already stopped
+	default:
+		close(s.stopCh)
+		<-s.doneCh
+	}
 }
