@@ -61,16 +61,35 @@ func Parse(raw string) ParsedInput {
 	}
 }
 
-// pipeToAI scans right-to-left for the last `|` whose right-hand side
-// starts with / or ? (an AI-side segment). Returns -1 if not found.
+// pipeToAI scans left-to-right for the first `|` whose right-hand side is an
+// AI segment (? query or /function). Scanning left-to-right means chained AI
+// pipes like "cat f | /summarize | /ctx add" split at the first AI boundary,
+// letting the recursive parser build the full chain correctly.
+//
+// An AI segment starting with / must be a bare name (no path separator in the
+// first token) to distinguish "/summarize" from "/usr/bin/grep".
 func pipeToAI(s string) int {
-	for i := len(s) - 1; i >= 0; i-- {
+	for i := 0; i < len(s); i++ {
 		if s[i] == '|' {
 			right := strings.TrimSpace(s[i+1:])
-			if strings.HasPrefix(right, "/") || strings.HasPrefix(right, "?") {
+			if isAISegment(right) {
 				return i
 			}
 		}
 	}
 	return -1
+}
+
+// isAISegment reports whether a trimmed string looks like an AI routing prefix.
+func isAISegment(s string) bool {
+	if strings.HasPrefix(s, "?") {
+		return true
+	}
+	if !strings.HasPrefix(s, "/") {
+		return false
+	}
+	// Must be a bare name — no path separator in the first token.
+	// This ensures "/summarize" matches but "/usr/bin/grep foo" does not.
+	first := strings.Fields(s[1:])
+	return len(first) > 0 && !strings.Contains(first[0], "/")
 }

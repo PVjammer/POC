@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pvjammer/ai-shell-poc/permissions"
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
@@ -86,9 +87,25 @@ func AllTools() []llm.ToolDef {
 	return []llm.ToolDef{BashToolDef()}
 }
 
-// AllHandlers returns the tool name → execution function map.
+// NewBashHandler returns a bash handler that checks permissions before running.
+// Commands classified as deny return an error to the agent. Commands classified
+// as confirm pause and prompt the user on /dev/tty before proceeding.
+func NewBashHandler() func(map[string]interface{}) (string, error) {
+	return func(args map[string]interface{}) (string, error) {
+		command, ok := args["command"].(string)
+		if !ok || strings.TrimSpace(command) == "" {
+			return "", fmt.Errorf("command argument is required")
+		}
+		if msg := permissions.Check(command); msg != "" {
+			return msg, nil // return to agent, not an error
+		}
+		return BashHandler(args)
+	}
+}
+
+// AllHandlers returns the tool name → execution function map with permissions enabled.
 func AllHandlers() map[string]func(map[string]interface{}) (string, error) {
 	return map[string]func(map[string]interface{}) (string, error){
-		"bash": BashHandler,
+		"bash": NewBashHandler(),
 	}
 }
