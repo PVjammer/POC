@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/chzyer/readline"
+	"github.com/ergochat/readline"
 	"github.com/pvjammer/ai-shell-poc/agent"
 	"github.com/pvjammer/ai-shell-poc/config"
 	"github.com/pvjammer/ai-shell-poc/functions"

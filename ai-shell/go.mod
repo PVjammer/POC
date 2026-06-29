@@ -3,7 +3,7 @@ module github.com/pvjammer/ai-shell-poc
 go 1.24.1
 
 require (
-	github.com/chzyer/readline v1.5.1
+	github.com/ergochat/readline v0.1.3
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/pvjammer/ai-sdk-go v0.1.0
 )
