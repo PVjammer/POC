@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -1164,11 +1165,75 @@ Rules:
 	go func() { <-sigCh; cancel() }()
 
 	fmt.Println()
-	err = s.agent.RunOneShot(ctx, systemPrompt, userMsg, func(token string) { fmt.Print(token) })
+	var msgBuf strings.Builder
+	err = s.agent.RunOneShot(ctx, systemPrompt, userMsg, func(token string) {
+		fmt.Print(token)
+		msgBuf.WriteString(token)
+	})
 	fmt.Println()
 	if err != nil && err != context.Canceled {
 		fmt.Fprintf(os.Stderr, "commit-msg: %v\n", err)
+		return
 	}
+
+	message := strings.TrimSpace(msgBuf.String())
+	if message == "" {
+		return
+	}
+	s.promptCommitAction(message)
+}
+
+// promptCommitAction shows a post-generation menu letting the user commit or
+// copy the message. Runs via /dev/tty so it works even when stdout is piped.
+func (s *Shell) promptCommitAction(message string) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return // non-interactive — just leave the message on screen
+	}
+	defer tty.Close()
+
+	fmt.Fprintf(tty, "\n\033[2m[c]ommit  [x] copy to clipboard  [enter] dismiss\033[0m ")
+	sc := bufio.NewScanner(tty)
+	if !sc.Scan() {
+		return
+	}
+	choice := strings.TrimSpace(strings.ToLower(sc.Text()))
+
+	switch {
+	case choice == "c" || choice == "commit":
+		out, err := exec.Command("git", "commit", "-m", message).CombinedOutput()
+		if len(out) > 0 {
+			fmt.Print(string(out))
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "git commit: %v\n", err)
+		}
+	case choice == "x" || choice == "copy":
+		if err := copyToClipboard(message); err != nil {
+			fmt.Fprintf(os.Stderr, "clipboard: %v\n", err)
+		} else {
+			fmt.Println("copied to clipboard")
+		}
+	}
+}
+
+// copyToClipboard writes text to the system clipboard using whatever tool is
+// available (wl-copy, xclip, xsel, pbcopy).
+func copyToClipboard(text string) error {
+	candidates := [][]string{
+		{"wl-copy"},
+		{"xclip", "-selection", "clipboard"},
+		{"xsel", "--clipboard", "--input"},
+		{"pbcopy"},
+	}
+	for _, args := range candidates {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Stdin = strings.NewReader(text)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("no clipboard utility found (install wl-clipboard, xclip, or xsel)")
 }
 
 // ── Context tools ─────────────────────────────────────────────────────────────
