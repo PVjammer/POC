@@ -19,12 +19,23 @@ const (
 	OverflowSummarize ToolOverflow = "summarize"
 )
 
+// PromptConfig controls the appearance of the shell prompt.
+type PromptConfig struct {
+	PathMaxDepth  int    `toml:"path_max_depth"`   // segments to show; 0 = full path
+	ShowGitBranch bool   `toml:"show_git_branch"`  // show (branch) after path
+	PathColor     string `toml:"path_color"`        // red green yellow blue magenta cyan white bold dim none
+	BranchColor   string `toml:"branch_color"`
+	JobColor      string `toml:"job_color"`         // color for [N✓] indicator
+	Suffix        string `toml:"suffix"`            // text after all segments, e.g. " $ "
+}
+
 // Config holds tuneable shell settings.
 type Config struct {
 	MaxHistoryMessages int          `toml:"max_history_messages"`
 	ToolOutputMaxChars int          `toml:"tool_output_max_chars"`
 	ToolOverflow       ToolOverflow `toml:"tool_output_overflow"`
 	CtxMaxInjectChars  int          `toml:"ctx_max_inject_chars"`
+	Prompt             PromptConfig `toml:"prompt"`
 }
 
 // Defaults returns the baseline configuration.
@@ -34,6 +45,36 @@ func Defaults() Config {
 		ToolOutputMaxChars: 4000,
 		ToolOverflow:       OverflowTruncate,
 		CtxMaxInjectChars:  8000,
+		Prompt: PromptConfig{
+			PathMaxDepth:  3,
+			ShowGitBranch: true,
+			PathColor:     "green",
+			BranchColor:   "magenta",
+			JobColor:      "yellow",
+			Suffix:        " $ ",
+		},
+	}
+}
+
+// applyPromptDefaults fills zero-valued prompt fields with sensible defaults.
+// Handles existing config files that predate the [prompt] section.
+func applyPromptDefaults(p *PromptConfig) {
+	// If all string fields are empty the section was absent — apply everything.
+	sectionAbsent := p.PathColor == "" && p.BranchColor == "" && p.JobColor == "" && p.Suffix == ""
+	if sectionAbsent {
+		p.ShowGitBranch = true
+	}
+	if p.PathColor == "" {
+		p.PathColor = "green"
+	}
+	if p.BranchColor == "" {
+		p.BranchColor = "magenta"
+	}
+	if p.JobColor == "" {
+		p.JobColor = "yellow"
+	}
+	if p.Suffix == "" {
+		p.Suffix = " $ "
 	}
 }
 
@@ -79,6 +120,7 @@ func Load() (Config, error) {
 		cfg.CtxMaxInjectChars = 500
 	}
 
+	applyPromptDefaults(&cfg.Prompt)
 	return cfg, nil
 }
 

@@ -12,7 +12,7 @@ build:
 
 install: build
 	mkdir -p $(BIN_DIR)
-	cp $(BIN) $(BIN_DIR)/$(BIN)
+	mv $(BIN) $(BIN_DIR)/$(BIN)
 
 clean:
 	rm -f $(BIN) $(BIN_DIR)/$(BIN)

@@ -25,6 +25,13 @@ Help the user accomplish tasks using shell commands and your own knowledge.
 Be concise. Show relevant output. Prefer doing over explaining.
 Use tools when needed; answer directly when you can.`
 
+// AdvisorySystemPrompt is used for ? (read-only) queries. The agent has no
+// tools in this mode — it answers from knowledge and context only.
+const AdvisorySystemPrompt = `You are an AI assistant embedded in a Unix terminal.
+Answer questions, explain concepts, and guide the user on how to accomplish tasks.
+Provide clear, concise explanations and concrete command examples in code blocks.
+Do not attempt to execute anything — describe what to do instead.`
+
 // LoopConfig holds tuneable parameters for the agent loop.
 type LoopConfig struct {
 	MaxHistoryMessages int    // number of messages to keep in context (default 20)
@@ -54,13 +61,15 @@ type ShellContext struct {
 // Loop is a stateful, multi-turn agent. One instance persists across user turns
 // so conversation history is maintained for the session.
 type Loop struct {
-	provider     llm.ToolCallingProvider
-	tools        []llm.ToolDef
-	handlers     map[string]func(map[string]interface{}) (string, error)
-	history      []llm.ChatMessage
-	shellCtx     ShellContext
-	contextSlots map[string]string
-	cfg          LoopConfig
+	provider       llm.ToolCallingProvider
+	tools          []llm.ToolDef
+	handlers       map[string]func(map[string]interface{}) (string, error)
+	history        []llm.ChatMessage
+	shellCtx       ShellContext
+	contextSlots   map[string]string
+	cfg            LoopConfig
+	spinnerEnabled bool
+	systemPrompt   string // empty = use baseSystemPrompt
 
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
@@ -74,11 +83,12 @@ func New(
 	handlers map[string]func(map[string]interface{}) (string, error),
 ) *Loop {
 	return &Loop{
-		provider: provider,
-		tools:    tools,
-		handlers: handlers,
-		history:  make([]llm.ChatMessage, 0, 32),
-		cfg:      defaultLoopConfig(),
+		provider:       provider,
+		tools:          tools,
+		handlers:       handlers,
+		history:        make([]llm.ChatMessage, 0, 32),
+		cfg:            defaultLoopConfig(),
+		spinnerEnabled: true,
 	}
 }
 
@@ -110,6 +120,24 @@ func (l *Loop) SetTools(tools []llm.ToolDef, handlers map[string]func(map[string
 	l.handlers = handlers
 }
 
+// SetProvider replaces the LLM provider (called when the model is switched mid-session).
+func (l *Loop) SetProvider(p llm.ToolCallingProvider) { l.provider = p }
+
+// SetSpinnerEnabled controls whether a spinner is shown during LLM waits.
+// Disable for background execution to avoid corrupting the foreground terminal.
+func (l *Loop) SetSpinnerEnabled(v bool) { l.spinnerEnabled = v }
+
+// SetSystemPrompt overrides the default system prompt for the next Run call.
+// Pass "" to restore the default agentic prompt.
+func (l *Loop) SetSystemPrompt(p string) { l.systemPrompt = p }
+
+func (l *Loop) newSpinnerOrNop() spinnerIface {
+	if l.spinnerEnabled {
+		return newSpinner()
+	}
+	return &noopSpinner{}
+}
+
 // Run executes one user turn — potentially many agent rounds.
 // onToken is called with each piece of the final text response.
 func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) error {
@@ -126,7 +154,7 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 	type callSig struct{ name, args string }
 	recentCalls := make(map[callSig]int)
 
-	sp := newSpinner()
+	sp := l.newSpinnerOrNop()
 
 	for round := 0; round < maxRounds; round++ {
 		if ctx.Err() != nil {
@@ -186,7 +214,7 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 				})
 			}
 
-			sp = newSpinner()
+			sp = l.newSpinnerOrNop()
 			continue
 		}
 
@@ -202,6 +230,7 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 		return nil
 	}
 
+	sp.stop()
 	return fmt.Errorf("reached max rounds (%d) without a final response", maxRounds)
 }
 
@@ -222,6 +251,9 @@ func (l *Loop) ToolNames() []string {
 
 func (l *Loop) buildMessages() []llm.ChatMessage {
 	sys := baseSystemPrompt
+	if l.systemPrompt != "" {
+		sys = l.systemPrompt
+	}
 
 	// Dynamic tool list.
 	if len(l.tools) > 0 {
@@ -324,6 +356,12 @@ func (l *Loop) summarizeLarge(ctx context.Context, toolName, content string) (st
 }
 
 // ── Spinner ───────────────────────────────────────────────────────────────────
+
+type spinnerIface interface{ stop() }
+
+type noopSpinner struct{}
+
+func (s *noopSpinner) stop() {}
 
 type spinner struct {
 	stopCh chan struct{}

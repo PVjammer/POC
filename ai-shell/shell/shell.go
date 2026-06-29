@@ -39,6 +39,11 @@ type Shell struct {
 	fnLoader *functions.Loader
 	jobs     *jobManager
 
+	// actTools/actHandlers are the full tool set for ! (agentic) mode.
+	// Advisory (?) mode uses nil tools so the model cannot call anything.
+	actTools    []llm.ToolDef
+	actHandlers map[string]func(map[string]interface{}) (string, error)
+
 	ctxSlots     map[string]string
 	lastCmd      string
 	lastExitCode int
@@ -81,7 +86,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	completer := NewHybridCompleter(append(metaCommands(), fnLoader.Names()...))
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            buildPrompt(nil),
+		Prompt:            buildPrompt(nil, appCfg.Prompt),
 		HistoryFile:       filepath.Join(os.Getenv("HOME"), ".ai_shell_history"),
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
@@ -98,13 +103,15 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	}
 
 	return &Shell{
-		cfg:      cfg,
-		appCfg:   appCfg,
-		rl:       rl,
-		agent:    agentLoop,
-		fnLoader: fnLoader,
-		jobs:     newJobManager(),
-		ctxSlots: ctxSlots,
+		cfg:         cfg,
+		appCfg:      appCfg,
+		rl:          rl,
+		agent:       agentLoop,
+		fnLoader:    fnLoader,
+		jobs:        newJobManager(),
+		ctxSlots:    ctxSlots,
+		actTools:    allTools,
+		actHandlers: allHandlers,
 	}, nil
 }
 
@@ -113,10 +120,11 @@ func (s *Shell) Run() error {
 	defer s.rl.Close()
 
 	fmt.Printf("ai-shell  model=%s  endpoint=%s\n", s.cfg.Model, s.cfg.Endpoint)
-	fmt.Println("  <cmd>       shell command (ls, vim, git, ...)")
-	fmt.Println("  ?<msg>      ask the AI")
-	fmt.Println("  /<fn> ...   run an AI function  (try /tools)")
-	fmt.Println("  /help       show all commands")
+	fmt.Println("  <cmd>          shell command  (ls, vim, git, ...)")
+	fmt.Println("  ?<msg>         ask the AI     (advisory — explains, no execution)")
+	fmt.Println("  !\"<msg>\"       act mode       (AI executes commands; permissions apply)")
+	fmt.Println("  /<fn> ...      AI function    (try /tools)")
+	fmt.Println("  /help          show all commands")
 	fmt.Println()
 
 	for {
@@ -124,7 +132,7 @@ func (s *Shell) Run() error {
 		for _, msg := range s.jobs.drain() {
 			fmt.Println(msg)
 		}
-		s.rl.SetPrompt(buildPrompt(s.jobs))
+		s.rl.SetPrompt(buildPrompt(s.jobs, s.appCfg.Prompt))
 
 		line, err := s.rl.Readline()
 		if err != nil {
@@ -163,6 +171,12 @@ func (s *Shell) Run() error {
 				s.runAgentBackground(in.Content)
 			} else {
 				s.runAgent(in.Content)
+			}
+		case InputAgentAct:
+			if background {
+				s.runAgentActBackground(in.Content)
+			} else {
+				s.runAgentAct(in.Content)
 			}
 		case InputMeta:
 			if s.runMeta(in.Content) {
@@ -239,10 +253,23 @@ func (s *Shell) runDirect(cmdStr string) {
 	s.lastStderr = stderrBuf.String()
 }
 
-// runAgent sends the message to the AI and streams its response.
-func (s *Shell) runAgent(msg string) {
+// setupAgentForMode configures tools and system prompt for advisory (?) or
+// agentic (!) mode. Must be called with agentMu held.
+func (s *Shell) setupAgentForMode(act bool) {
+	if act {
+		s.agent.SetTools(s.actTools, s.actHandlers)
+		s.agent.SetSystemPrompt("") // use agent package default (agentic)
+	} else {
+		s.agent.SetTools(nil, nil)
+		s.agent.SetSystemPrompt(agent.AdvisorySystemPrompt)
+	}
+}
+
+// runAgentForeground is the shared foreground agent runner for both modes.
+func (s *Shell) runAgentForeground(msg string, act bool) {
 	s.agentMu.Lock()
 	defer s.agentMu.Unlock()
+	s.setupAgentForMode(act)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -253,10 +280,7 @@ func (s *Shell) runAgent(msg string) {
 	go func() { <-sigCh; cancel() }()
 
 	fmt.Println()
-
-	err := s.agent.Run(ctx, msg, func(token string) {
-		fmt.Print(token)
-	})
+	err := s.agent.Run(ctx, msg, func(token string) { fmt.Print(token) })
 	fmt.Println()
 
 	if err != nil && err != context.Canceled {
@@ -264,11 +288,18 @@ func (s *Shell) runAgent(msg string) {
 	}
 }
 
-// runAgentCapture runs the agent and returns the full response as a string.
-// Used by background agent jobs.
-func (s *Shell) runAgentCapture(ctx context.Context, msg string) (string, error) {
+func (s *Shell) runAgent(msg string)    { s.runAgentForeground(msg, false) }
+func (s *Shell) runAgentAct(msg string) { s.runAgentForeground(msg, true) }
+
+// runAgentCapture runs the agent in capture mode (no terminal output).
+// Spinner is suppressed — runs in a background goroutine and would corrupt
+// the foreground terminal cursor if allowed to write.
+func (s *Shell) runAgentCapture(ctx context.Context, msg string, act bool) (string, error) {
 	s.agentMu.Lock()
 	defer s.agentMu.Unlock()
+	s.agent.SetSpinnerEnabled(false)
+	defer s.agent.SetSpinnerEnabled(true)
+	s.setupAgentForMode(act)
 	var buf strings.Builder
 	err := s.agent.Run(ctx, msg, func(token string) { buf.WriteString(token) })
 	return strings.TrimSpace(buf.String()), err
@@ -288,33 +319,101 @@ func (s *Shell) runDirectBackground(cmd string) {
 	fmt.Printf("[%d] started: %s\n", id, display)
 }
 
-// runAgentBackground sends the message to the agent as a background job.
-func (s *Shell) runAgentBackground(msg string) {
-	display := "?" + truncateDisplay(msg, 37)
+// runAgentBg is the shared background agent runner for both modes.
+func (s *Shell) runAgentBg(msg string, act bool) {
+	prefix := "?"
+	if act {
+		prefix = "!"
+	}
+	display := prefix + truncateDisplay(msg, 37)
 	s.syncAgentContext()
 	id := s.jobs.start(display, func() (string, error) {
-		return s.runAgentCapture(context.Background(), msg)
+		return s.runAgentCapture(context.Background(), msg, act)
 	})
 	fmt.Printf("[%d] started: %s\n", id, display)
 }
+
+func (s *Shell) runAgentBackground(msg string)    { s.runAgentBg(msg, false) }
+func (s *Shell) runAgentActBackground(msg string) { s.runAgentBg(msg, true) }
 
 // runPipelineBackground runs a pipeline (bash | /fn or bash | ?msg) as a background job.
 func (s *Shell) runPipelineBackground(leftCmd string, right *ParsedInput) {
 	display := truncateDisplay(leftCmd+" | "+rightDisplay(right), 40)
 	s.syncAgentContext()
 	id := s.jobs.start(display, func() (string, error) {
-		c := exec.Command("sh", "-c", leftCmd)
-		var outBuf bytes.Buffer
-		c.Stdout = &outBuf
-		c.Stderr = os.Stderr
-		if err := c.Run(); err != nil {
-			if outBuf.Len() == 0 {
-				return "", err
-			}
+		content, err := s.resolveLeftContent(leftCmd)
+		if err != nil {
+			return "", err
 		}
-		return s.applyRightCapture(context.Background(), outBuf.String(), right)
+		if strings.TrimSpace(content) == "" {
+			return "", fmt.Errorf("left side produced no output")
+		}
+		return s.applyRightCapture(context.Background(), content, right)
 	})
 	fmt.Printf("[%d] started: %s\n", id, display)
+}
+
+// resolveLeftContent handles the left side of a pipeline. If leftCmd starts
+// with "/" it is treated as a meta command and its output is captured
+// programmatically. Otherwise it is run as a bash command.
+func (s *Shell) resolveLeftContent(leftCmd string) (string, error) {
+	if strings.HasPrefix(leftCmd, "/") {
+		return s.runMetaCapture(leftCmd[1:])
+	}
+	c := exec.Command("sh", "-c", leftCmd)
+	var outBuf bytes.Buffer
+	c.Stdout = &outBuf
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		if outBuf.Len() == 0 {
+			return "", err
+		}
+		// Non-zero exit but produced output — continue with what we got.
+	}
+	return outBuf.String(), nil
+}
+
+// runMetaCapture executes a meta command and returns its output as a string.
+// Only commands that produce text suitable for piping are supported.
+func (s *Shell) runMetaCapture(cmd string) (string, error) {
+	parts := splitWords(cmd)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("empty command")
+	}
+	switch parts[0] {
+	case "job", "jobs":
+		if len(parts) < 2 {
+			return "", fmt.Errorf("/job: usage: /job <N>")
+		}
+		id, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return "", fmt.Errorf("/job: invalid id %q", parts[1])
+		}
+		j := s.jobs.get(id)
+		if j == nil {
+			return "", fmt.Errorf("/job: no job %d", id)
+		}
+		switch j.status {
+		case jobRunning:
+			return "", fmt.Errorf("/job %d: still running — wait for it to finish first", id)
+		case jobFailed:
+			return "", fmt.Errorf("/job %d: failed: %v", id, j.err)
+		case jobDone:
+			return j.output, nil
+		}
+	case "ctx":
+		// /ctx show <name>
+		if len(parts) < 3 || parts[1] != "show" {
+			return "", fmt.Errorf("/ctx: pipe usage: /ctx show <name>")
+		}
+		name := parts[2]
+		v, ok := s.ctxSlots[name]
+		if !ok {
+			return "", fmt.Errorf("/ctx: no slot %q  (try /ctx list)", name)
+		}
+		return v, nil
+	}
+	return "", fmt.Errorf("/%s: not pipeable — only /job and /ctx show can feed a pipeline", parts[0])
 }
 
 // applyRightCapture is the capture-mode version of applyRight — returns output
@@ -355,7 +454,13 @@ func (s *Shell) applyRightCapture(ctx context.Context, content string, right *Pa
 		if q := strings.TrimSpace(right.Content); q != "" {
 			msg = msg + "\n\n" + q
 		}
-		return s.runAgentCapture(ctx, msg)
+		return s.runAgentCapture(ctx, msg, false)
+	case InputAgentAct:
+		msg := strings.TrimSpace(content)
+		if q := strings.TrimSpace(right.Content); q != "" {
+			msg = msg + "\n\n" + q
+		}
+		return s.runAgentCapture(ctx, msg, true)
 	}
 	return "", nil
 }
@@ -394,7 +499,20 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 		fmt.Println("conversation history cleared")
 
 	case "model":
-		fmt.Printf("model: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+		if len(args) == 0 {
+			fmt.Printf("model: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+		} else {
+			model := args[0]
+			endpoint := s.cfg.Endpoint
+			if len(args) > 1 {
+				endpoint = args[1]
+			}
+			if err := s.setModel(model, endpoint); err != nil {
+				fmt.Fprintf(os.Stderr, "model: %v\n", err)
+			} else {
+				fmt.Printf("model: switched to %s  endpoint: %s\n", model, endpoint)
+			}
+		}
 
 	case "history":
 		fmt.Printf("messages in context: %d\n", s.agent.HistoryLen())
@@ -437,7 +555,8 @@ func (s *Shell) runFunction(name string, args []string) bool {
 func (s *Shell) runCtx(args []string, piped string) {
 	if len(args) == 0 && strings.TrimSpace(piped) == "" {
 		fmt.Println("usage:")
-		fmt.Println("  cat file | /ctx add <name>   store piped content as a named slot")
+		fmt.Println("  cat file | /ctx set <name>   overwrite a slot with piped content")
+		fmt.Println("  cat file | /ctx add <name>   append piped content to a slot")
 		fmt.Println("  /ctx show <name>              print slot content")
 		fmt.Println("  /ctx list                     list all slots with sizes")
 		fmt.Println("  /ctx clear [name]             remove one slot or all")
@@ -454,15 +573,14 @@ func (s *Shell) runCtx(args []string, piped string) {
 	}
 
 	switch sub {
-	case "add":
+	case "set":
 		if strings.TrimSpace(piped) == "" {
-			fmt.Fprintln(os.Stderr, "ctx: pipe content into /ctx add — e.g. cat file.md | /ctx add design")
+			fmt.Fprintln(os.Stderr, "ctx: pipe content into /ctx set — e.g. cat file.md | /ctx set design")
 			return
 		}
 		s.ctxSlots[slotName] = strings.TrimSpace(piped)
 		size := len(s.ctxSlots[slotName])
 
-		// Named slots persist across sessions; "default" is session-only.
 		if slotName != "default" {
 			if err := config.SaveContext(slotName, s.ctxSlots[slotName]); err != nil {
 				fmt.Fprintf(os.Stderr, "ctx: warning: could not persist slot: %v\n", err)
@@ -471,10 +589,37 @@ func (s *Shell) runCtx(args []string, piped string) {
 
 		cap := s.appCfg.CtxMaxInjectChars
 		if cap > 0 && size > cap {
-			fmt.Printf("ctx: stored %q (%d chars) — only first %d chars will be injected per turn; use /ctx show %s for full content\n",
+			fmt.Printf("ctx: set %q (%d chars) — only first %d chars will be injected per turn; use /ctx show %s for full content\n",
 				slotName, size, cap, slotName)
 		} else {
-			fmt.Printf("ctx: stored %q (%d chars)\n", slotName, size)
+			fmt.Printf("ctx: set %q (%d chars)\n", slotName, size)
+		}
+
+	case "add":
+		if strings.TrimSpace(piped) == "" {
+			fmt.Fprintln(os.Stderr, "ctx: pipe content into /ctx add — e.g. cat file.md | /ctx add docs")
+			return
+		}
+		content := strings.TrimSpace(piped)
+		if existing, ok := s.ctxSlots[slotName]; ok && existing != "" {
+			s.ctxSlots[slotName] = existing + "\n\n" + content
+		} else {
+			s.ctxSlots[slotName] = content
+		}
+		size := len(s.ctxSlots[slotName])
+
+		if slotName != "default" {
+			if err := config.SaveContext(slotName, s.ctxSlots[slotName]); err != nil {
+				fmt.Fprintf(os.Stderr, "ctx: warning: could not persist slot: %v\n", err)
+			}
+		}
+
+		cap := s.appCfg.CtxMaxInjectChars
+		if cap > 0 && size > cap {
+			fmt.Printf("ctx: appended to %q (%d chars total) — only first %d chars will be injected per turn\n",
+				slotName, size, cap)
+		} else {
+			fmt.Printf("ctx: appended to %q (%d chars total)\n", slotName, size)
 		}
 
 	case "show":
@@ -518,14 +663,23 @@ func (s *Shell) runCtx(args []string, piped string) {
 // runConfig handles /config subcommands.
 func (s *Shell) runConfig(args []string) {
 	if len(args) == 0 {
+		p := s.appCfg.Prompt
 		fmt.Println()
 		fmt.Printf("  %-30s %v\n", "max_history_messages", s.appCfg.MaxHistoryMessages)
 		fmt.Printf("  %-30s %v\n", "tool_output_max_chars", s.appCfg.ToolOutputMaxChars)
 		fmt.Printf("  %-30s %v\n", "tool_output_overflow", s.appCfg.ToolOverflow)
 		fmt.Printf("  %-30s %v\n", "ctx_max_inject_chars", s.appCfg.CtxMaxInjectChars)
 		fmt.Println()
+		fmt.Printf("  %-30s %v\n", "prompt.path_max_depth", p.PathMaxDepth)
+		fmt.Printf("  %-30s %v\n", "prompt.show_git_branch", p.ShowGitBranch)
+		fmt.Printf("  %-30s %v\n", "prompt.path_color", p.PathColor)
+		fmt.Printf("  %-30s %v\n", "prompt.branch_color", p.BranchColor)
+		fmt.Printf("  %-30s %v\n", "prompt.job_color", p.JobColor)
+		fmt.Printf("  %-30s %q\n", "prompt.suffix", p.Suffix)
+		fmt.Println()
 		fmt.Println("  /config set <key> <value>   change a setting")
 		fmt.Println("  /config reset               restore defaults")
+		fmt.Println("  colors: red green yellow blue magenta cyan white bold dim none")
 		fmt.Println()
 		return
 	}
@@ -565,6 +719,43 @@ func (s *Shell) runConfig(args []string) {
 				return
 			}
 			s.appCfg.CtxMaxInjectChars = n
+		case "prompt.path_max_depth":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 0 {
+				fmt.Fprintln(os.Stderr, "config: prompt.path_max_depth must be a non-negative integer (0 = full path)")
+				return
+			}
+			s.appCfg.Prompt.PathMaxDepth = n
+		case "prompt.show_git_branch":
+			switch val {
+			case "true", "1", "yes":
+				s.appCfg.Prompt.ShowGitBranch = true
+			case "false", "0", "no":
+				s.appCfg.Prompt.ShowGitBranch = false
+			default:
+				fmt.Fprintln(os.Stderr, "config: prompt.show_git_branch must be true or false")
+				return
+			}
+		case "prompt.path_color":
+			if !isValidColor(val) {
+				fmt.Fprintln(os.Stderr, "config: valid colors: red green yellow blue magenta cyan white bold dim none")
+				return
+			}
+			s.appCfg.Prompt.PathColor = val
+		case "prompt.branch_color":
+			if !isValidColor(val) {
+				fmt.Fprintln(os.Stderr, "config: valid colors: red green yellow blue magenta cyan white bold dim none")
+				return
+			}
+			s.appCfg.Prompt.BranchColor = val
+		case "prompt.job_color":
+			if !isValidColor(val) {
+				fmt.Fprintln(os.Stderr, "config: valid colors: red green yellow blue magenta cyan white bold dim none")
+				return
+			}
+			s.appCfg.Prompt.JobColor = val
+		case "prompt.suffix":
+			s.appCfg.Prompt.Suffix = val
 		default:
 			fmt.Fprintf(os.Stderr, "config: unknown key %q\n", key)
 			return
@@ -593,9 +784,17 @@ func (s *Shell) printHelp() {
 	fmt.Println("Shell commands (anything runs as bash):")
 	fmt.Println("  ls, vim, git status, cd .., ...   — normal shell")
 	fmt.Println()
-	fmt.Println("AI:")
-	fmt.Println("  ?<text>        ask the AI (agent can run commands for you)")
-	fmt.Println("  ?<text> &      run in background; see /jobs when done")
+	fmt.Println("AI (advisory — explains and guides, never executes):")
+	fmt.Println("  ?<text>            ask a question or request guidance")
+	fmt.Println("  ?<text> &          run in background")
+	fmt.Println()
+	fmt.Println("AI (agentic — executes commands; permissions tier applies):")
+	fmt.Println("  !\"<text>\"          ask the AI to act")
+	fmt.Println("  !\"<text>\" &        act in background")
+	fmt.Println()
+	fmt.Println("Pipelines work with both modes:")
+	fmt.Println("  cmd | ?<text>      pipe output to advisory AI")
+	fmt.Println("  cmd | !\"<text>\"    pipe output to agentic AI")
 	fmt.Println()
 	fmt.Println("AI functions (slash commands):")
 	for _, name := range s.fnLoader.Names() {
@@ -604,16 +803,21 @@ func (s *Shell) printHelp() {
 	fmt.Println()
 	fmt.Println("Built-in commands:")
 	fmt.Println("  /tools             list tools available to the AI agent")
-	fmt.Println("  /ctx add <name>    pipe content into a named context slot")
-	fmt.Println("  /ctx show <name>   print a context slot")
-	fmt.Println("  /ctx list          list all context slots")
+	fmt.Println("  /ctx set <name>    overwrite a slot with piped content")
+	fmt.Println("  /ctx add <name>    append piped content to a slot")
+	fmt.Println("  /ctx show <name>   print a slot's content")
+	fmt.Println("  /ctx list          list all slots with sizes")
 	fmt.Println("  /ctx clear [name]  remove one slot or all")
 	fmt.Println("  /config            show or change settings")
 	fmt.Println("  /jobs              list background jobs")
 	fmt.Println("  /job <N>           show output of job N")
+	fmt.Println("  /job <N> | /fn     pipe job output into a function")
+	fmt.Println("  /job <N> | ?msg    pipe job output to advisory AI")
+	fmt.Println("  /job <N> | /ctx add <name>  store job output in context")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
-	fmt.Println("  /model             show current model")
+	fmt.Println("  /model             show current model and endpoint")
+	fmt.Println("  /model <name>      switch to a different model")
 	fmt.Println("  /history           show number of messages in context")
 	fmt.Println("  /exit              exit the shell")
 	fmt.Println()
@@ -629,8 +833,8 @@ func (s *Shell) printTools() {
 	fmt.Println()
 }
 
-// runPipeline executes the left bash command, captures its stdout, and passes
-// it through the right-side chain (which may itself be a pipeline of AI functions).
+// runPipeline resolves the left side (bash command or /meta command) and passes
+// its output through the right-side chain (/fn, ?query, or a further pipeline).
 func (s *Shell) runPipeline(leftCmd string, right *ParsedInput) {
 	debug := os.Getenv("BAISH_DEBUG") != ""
 	if debug {
@@ -642,24 +846,17 @@ func (s *Shell) runPipeline(leftCmd string, right *ParsedInput) {
 		return
 	}
 
-	cmd := exec.Command("sh", "-c", leftCmd)
-	var outBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		if _, isExit := err.(*exec.ExitError); !isExit {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			return
-		}
-		if outBuf.Len() == 0 {
-			fmt.Fprintf(os.Stderr, "pipeline: left side produced no output\n")
-			return
-		}
+	content, err := s.resolveLeftContent(leftCmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pipeline: %v\n", err)
+		return
 	}
-	captured := outBuf.String()
 	if debug {
-		fmt.Fprintf(os.Stderr, "[debug] captured %d bytes from left side\n", len(captured))
+		fmt.Fprintf(os.Stderr, "[debug] captured %d bytes from left side\n", len(content))
+	}
+	if strings.TrimSpace(content) == "" {
+		fmt.Fprintf(os.Stderr, "pipeline: left side produced no output\n")
+		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -669,12 +866,12 @@ func (s *Shell) runPipeline(leftCmd string, right *ParsedInput) {
 	defer signal.Stop(sigCh)
 	go func() { <-sigCh; cancel() }()
 
-	s.applyRight(ctx, captured, right)
+	s.applyRight(ctx, content, right)
 }
 
 // applyRight applies the right side of a pipeline to already-captured content.
 // right may be InputMeta (terminal function), InputPipeline (chained function),
-// or InputAgent. This enables chains like: cat f | /summarize | /ctx add
+// or InputAgent. This enables chains like: cat f | /summarize | /ctx set summary
 func (s *Shell) applyRight(ctx context.Context, content string, right *ParsedInput) {
 	if right == nil {
 		return
@@ -722,6 +919,13 @@ func (s *Shell) applyRight(ctx context.Context, content string, right *ParsedInp
 		}
 		s.syncAgentContext()
 		s.runAgent(msg)
+	case InputAgentAct:
+		msg := strings.TrimSpace(content)
+		if q := strings.TrimSpace(right.Content); q != "" {
+			msg = msg + "\n\n" + q
+		}
+		s.syncAgentContext()
+		s.runAgentAct(msg)
 	}
 }
 
@@ -815,6 +1019,30 @@ func (s *Shell) syncAgentContext() {
 	})
 }
 
+// setModel switches the LLM provider and functions loader to a new model/endpoint.
+func (s *Shell) setModel(model, endpoint string) error {
+	provider, err := llm.NewOllamaProvider(endpoint, model)
+	if err != nil {
+		return fmt.Errorf("create provider: %w", err)
+	}
+	s.agent.SetProvider(provider)
+
+	s.fnLoader = functions.New(functions.ShellConfig{
+		LLMEndpoint: endpoint,
+		LLMModel:    model,
+	})
+	allTools := append(tools.AllTools(), s.fnLoader.ToolDefs()...)
+	allHandlers := tools.AllHandlers()
+	for k, v := range s.fnLoader.ToolHandlers() {
+		allHandlers[k] = v
+	}
+	s.agent.SetTools(allTools, allHandlers)
+
+	s.cfg.Model = model
+	s.cfg.Endpoint = endpoint
+	return nil
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 type teeWriter struct {
@@ -830,7 +1058,7 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func buildPrompt(jobs *jobManager) string {
+func buildPrompt(jobs *jobManager, cfg config.PromptConfig) string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "?"
@@ -838,19 +1066,94 @@ func buildPrompt(jobs *jobManager) string {
 	if home := os.Getenv("HOME"); home != "" {
 		cwd = strings.Replace(cwd, home, "~", 1)
 	}
-	var indicator string
+	cwd = truncatePath(cwd, cfg.PathMaxDepth)
+
+	var sb strings.Builder
+	sb.WriteString(colorize(cwd, cfg.PathColor))
+
+	if cfg.ShowGitBranch {
+		if branch := gitBranch(); branch != "" {
+			sb.WriteByte(' ')
+			sb.WriteString(colorize("("+branch+")", cfg.BranchColor))
+		}
+	}
+
 	if jobs != nil {
 		running, done := jobs.activity()
 		switch {
 		case running > 0 && done > 0:
-			indicator = fmt.Sprintf(" \033[2m[%d⋯ %d✓]\033[0m", running, done)
+			sb.WriteByte(' ')
+			sb.WriteString(colorize(fmt.Sprintf("[%d⋯ %d✓]", running, done), cfg.JobColor))
 		case running > 0:
-			indicator = fmt.Sprintf(" \033[2m[%d⋯]\033[0m", running)
+			sb.WriteByte(' ')
+			sb.WriteString(colorize(fmt.Sprintf("[%d⋯]", running), "dim"))
 		case done > 0:
-			indicator = fmt.Sprintf(" \033[33m[%d✓]\033[0m", done)
+			sb.WriteByte(' ')
+			sb.WriteString(colorize(fmt.Sprintf("[%d✓]", done), cfg.JobColor))
 		}
 	}
-	return fmt.Sprintf("\033[32m%s\033[0m%s $ ", cwd, indicator)
+
+	sb.WriteString(cfg.Suffix)
+	return sb.String()
+}
+
+// truncatePath keeps the last maxDepth path segments, prefixed with "...".
+// 0 means return the full path unchanged.
+func truncatePath(path string, maxDepth int) string {
+	if maxDepth <= 0 {
+		return path
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) <= maxDepth {
+		return path
+	}
+	return ".../" + strings.Join(parts[len(parts)-maxDepth:], "/")
+}
+
+// gitBranch returns the current git branch name, or "" if not in a repo.
+func gitBranch() string {
+	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	branch := strings.TrimSpace(string(out))
+	if branch == "HEAD" {
+		// detached HEAD — show short commit hash instead
+		out2, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+		if err != nil {
+			return "HEAD"
+		}
+		return strings.TrimSpace(string(out2))
+	}
+	return branch
+}
+
+var ansiColors = map[string]string{
+	"red":     "\033[31m",
+	"green":   "\033[32m",
+	"yellow":  "\033[33m",
+	"blue":    "\033[34m",
+	"magenta": "\033[35m",
+	"cyan":    "\033[36m",
+	"white":   "\033[37m",
+	"bold":    "\033[1m",
+	"dim":     "\033[2m",
+}
+
+// colorize wraps text in an ANSI color escape, or returns it unchanged for "none"/empty.
+func colorize(text, color string) string {
+	if code, ok := ansiColors[color]; ok {
+		return code + text + "\033[0m"
+	}
+	return text
+}
+
+func isValidColor(s string) bool {
+	if s == "none" || s == "" {
+		return true
+	}
+	_, ok := ansiColors[s]
+	return ok
 }
 
 // truncateDisplay shortens a command string for display in job listings.

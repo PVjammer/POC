@@ -8,8 +8,10 @@ type InputType int
 const (
 	// InputDirect: plain text or !cmd — pass to bash
 	InputDirect InputType = iota
-	// InputAgent: ?msg — send to AI agent
+	// InputAgent: ?msg — advisory AI (no tool execution)
 	InputAgent
+	// InputAgentAct: !"msg" — agentic AI (may execute commands; permissions apply)
+	InputAgentAct
 	// InputMeta: /cmd or /fn — built-in command or AI function
 	InputMeta
 	// InputPipeline: <bash_cmd> | /fn  or  <bash_cmd> | ?msg
@@ -49,10 +51,19 @@ func Parse(raw string) ParsedInput {
 
 	switch {
 	case strings.HasPrefix(raw, "!"):
-		// Explicit bash override (redundant now, kept for muscle memory).
-		return ParsedInput{Type: InputDirect, Content: strings.TrimSpace(raw[1:])}
+		rest := raw[1:]
+		// !"..." or !'...' → agentic mode; bare !cmd → direct bash (history expansion etc.)
+		if len(rest) > 0 && (rest[0] == '"' || rest[0] == '\'') {
+			return ParsedInput{Type: InputAgentAct, Content: strings.TrimSpace(stripOuterQuotes(rest))}
+		}
+		return ParsedInput{Type: InputDirect, Content: strings.TrimSpace(rest)}
 	case strings.HasPrefix(raw, "?"):
-		return ParsedInput{Type: InputAgent, Content: strings.TrimSpace(raw[1:])}
+		rest := raw[1:]
+		// Optional quotes — ?"..." and ?... are both advisory
+		if len(rest) > 0 && (rest[0] == '"' || rest[0] == '\'') {
+			return ParsedInput{Type: InputAgent, Content: strings.TrimSpace(stripOuterQuotes(rest))}
+		}
+		return ParsedInput{Type: InputAgent, Content: strings.TrimSpace(rest)}
 	case strings.HasPrefix(raw, "/"):
 		return ParsedInput{Type: InputMeta, Content: strings.TrimSpace(raw[1:])}
 	default:
@@ -85,6 +96,10 @@ func isAISegment(s string) bool {
 	if strings.HasPrefix(s, "?") {
 		return true
 	}
+	// !"..." is an agentic segment
+	if len(s) > 1 && s[0] == '!' && (s[1] == '"' || s[1] == '\'') {
+		return true
+	}
 	if !strings.HasPrefix(s, "/") {
 		return false
 	}
@@ -92,4 +107,21 @@ func isAISegment(s string) bool {
 	// This ensures "/summarize" matches but "/usr/bin/grep foo" does not.
 	first := strings.Fields(s[1:])
 	return len(first) > 0 && !strings.Contains(first[0], "/")
+}
+
+// stripOuterQuotes removes a matching pair of surrounding " or ' characters.
+// If the string has an opening quote but no matching closing quote, only the
+// opening quote is removed. Non-quoted strings are returned unchanged.
+func stripOuterQuotes(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	q := s[0]
+	if q != '"' && q != '\'' {
+		return s
+	}
+	if len(s) >= 2 && s[len(s)-1] == q {
+		return s[1 : len(s)-1]
+	}
+	return s[1:] // unclosed quote — strip opening only
 }
