@@ -669,6 +669,10 @@ func (s *Shell) runConfig(args []string) {
 		fmt.Printf("  %-30s %v\n", "tool_output_max_chars", s.appCfg.ToolOutputMaxChars)
 		fmt.Printf("  %-30s %v\n", "tool_output_overflow", s.appCfg.ToolOverflow)
 		fmt.Printf("  %-30s %v\n", "ctx_max_inject_chars", s.appCfg.CtxMaxInjectChars)
+		fmt.Printf("  %-30s %v\n", "tool_output_keep_rounds", s.appCfg.ToolOutputKeepRounds)
+		fmt.Printf("  %-30s %v\n", "max_context_tokens", s.appCfg.MaxContextTokens)
+		fmt.Printf("  %-30s %v\n", "compaction_threshold", s.appCfg.CompactionThreshold)
+		fmt.Printf("  %-30s %v\n", "compaction_tail_messages", s.appCfg.CompactionTailMessages)
 		fmt.Println()
 		fmt.Printf("  %-30s %v\n", "prompt.path_max_depth", p.PathMaxDepth)
 		fmt.Printf("  %-30s %v\n", "prompt.show_git_branch", p.ShowGitBranch)
@@ -719,6 +723,34 @@ func (s *Shell) runConfig(args []string) {
 				return
 			}
 			s.appCfg.CtxMaxInjectChars = n
+		case "tool_output_keep_rounds":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 1 {
+				fmt.Fprintln(os.Stderr, "config: tool_output_keep_rounds must be an integer >= 1")
+				return
+			}
+			s.appCfg.ToolOutputKeepRounds = n
+		case "max_context_tokens":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 1024 {
+				fmt.Fprintln(os.Stderr, "config: max_context_tokens must be an integer >= 1024")
+				return
+			}
+			s.appCfg.MaxContextTokens = n
+		case "compaction_threshold":
+			f, err := strconv.ParseFloat(val, 64)
+			if err != nil || f <= 0 || f >= 1 {
+				fmt.Fprintln(os.Stderr, "config: compaction_threshold must be a float between 0 and 1 (e.g. 0.75)")
+				return
+			}
+			s.appCfg.CompactionThreshold = f
+		case "compaction_tail_messages":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 4 {
+				fmt.Fprintln(os.Stderr, "config: compaction_tail_messages must be an integer >= 4")
+				return
+			}
+			s.appCfg.CompactionTailMessages = n
 		case "prompt.path_max_depth":
 			n, err := strconv.Atoi(val)
 			if err != nil || n < 0 {
@@ -1012,10 +1044,14 @@ func (s *Shell) syncAgentContext() {
 	})
 	s.agent.SetContextSlots(s.ctxSlots)
 	s.agent.SetConfig(agent.LoopConfig{
-		MaxHistoryMessages: s.appCfg.MaxHistoryMessages,
-		ToolOutputMaxChars: s.appCfg.ToolOutputMaxChars,
-		ToolOverflow:       string(s.appCfg.ToolOverflow),
-		CtxMaxInjectChars:  s.appCfg.CtxMaxInjectChars,
+		MaxHistoryMessages:     s.appCfg.MaxHistoryMessages,
+		ToolOutputMaxChars:     s.appCfg.ToolOutputMaxChars,
+		ToolOverflow:           string(s.appCfg.ToolOverflow),
+		CtxMaxInjectChars:      s.appCfg.CtxMaxInjectChars,
+		ToolOutputKeepRounds:   s.appCfg.ToolOutputKeepRounds,
+		MaxContextTokens:       s.appCfg.MaxContextTokens,
+		CompactionThreshold:    s.appCfg.CompactionThreshold,
+		CompactionTailMessages: s.appCfg.CompactionTailMessages,
 	})
 }
 

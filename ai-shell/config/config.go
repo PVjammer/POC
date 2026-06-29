@@ -36,15 +36,25 @@ type Config struct {
 	ToolOverflow       ToolOverflow `toml:"tool_output_overflow"`
 	CtxMaxInjectChars  int          `toml:"ctx_max_inject_chars"`
 	Prompt             PromptConfig `toml:"prompt"`
+
+	// Context / compaction settings.
+	ToolOutputKeepRounds   int     `toml:"tool_output_keep_rounds"`  // rounds of tool outputs to keep verbatim
+	MaxContextTokens       int     `toml:"max_context_tokens"`       // model context ceiling in tokens
+	CompactionThreshold    float64 `toml:"compaction_threshold"`     // fire LLM compaction at this fraction of ceiling
+	CompactionTailMessages int     `toml:"compaction_tail_messages"` // messages always kept verbatim in tail
 }
 
 // Defaults returns the baseline configuration.
 func Defaults() Config {
 	return Config{
-		MaxHistoryMessages: 20,
-		ToolOutputMaxChars: 4000,
-		ToolOverflow:       OverflowTruncate,
-		CtxMaxInjectChars:  8000,
+		MaxHistoryMessages:     20,
+		ToolOutputMaxChars:     4000,
+		ToolOverflow:           OverflowTruncate,
+		CtxMaxInjectChars:      8000,
+		ToolOutputKeepRounds:   3,
+		MaxContextTokens:       8192,
+		CompactionThreshold:    0.75,
+		CompactionTailMessages: 20,
 		Prompt: PromptConfig{
 			PathMaxDepth:  3,
 			ShowGitBranch: true,
@@ -118,6 +128,18 @@ func Load() (Config, error) {
 	}
 	if cfg.CtxMaxInjectChars < 500 {
 		cfg.CtxMaxInjectChars = 500
+	}
+	if cfg.ToolOutputKeepRounds < 1 {
+		cfg.ToolOutputKeepRounds = 1
+	}
+	if cfg.MaxContextTokens < 1024 {
+		cfg.MaxContextTokens = 4096
+	}
+	if cfg.CompactionThreshold <= 0 || cfg.CompactionThreshold >= 1 {
+		cfg.CompactionThreshold = 0.75
+	}
+	if cfg.CompactionTailMessages < 4 {
+		cfg.CompactionTailMessages = 4
 	}
 
 	applyPromptDefaults(&cfg.Prompt)

@@ -12,6 +12,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -38,14 +39,28 @@ type LoopConfig struct {
 	ToolOutputMaxChars int    // truncate/summarize tool results above this (default 4000)
 	ToolOverflow       string // "truncate" or "summarize"
 	CtxMaxInjectChars  int    // max chars to inject per context slot (default 8000)
+
+	// Phase 1 — tool output stripping.
+	ToolOutputKeepRounds int // rounds of tool outputs to keep verbatim; older ones are stripped (default 3)
+
+	// Phase 2 — token budget.
+	MaxContextTokens int // model context ceiling in tokens; history trimmed to stay under 75% (default 8192)
+
+	// Phase 4 — LLM compaction.
+	CompactionThreshold    float64 // fire compaction at this fraction of MaxContextTokens (default 0.75)
+	CompactionTailMessages int     // messages always kept verbatim in the protected tail (default 20)
 }
 
 func defaultLoopConfig() LoopConfig {
 	return LoopConfig{
-		MaxHistoryMessages: 20,
-		ToolOutputMaxChars: 4000,
-		ToolOverflow:       "truncate",
-		CtxMaxInjectChars:  8000,
+		MaxHistoryMessages:     20,
+		ToolOutputMaxChars:     4000,
+		ToolOverflow:           "truncate",
+		CtxMaxInjectChars:      8000,
+		ToolOutputKeepRounds:   3,
+		MaxContextTokens:       8192,
+		CompactionThreshold:    0.75,
+		CompactionTailMessages: 20,
 	}
 }
 
@@ -70,6 +85,10 @@ type Loop struct {
 	cfg            LoopConfig
 	spinnerEnabled bool
 	systemPrompt   string // empty = use baseSystemPrompt
+
+	// Compaction state (Phase 4).
+	compactionSummary string // current structured summary; empty = never compacted
+	compactionDepth   int    // number of times compaction has run this session
 
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
@@ -111,6 +130,18 @@ func (l *Loop) SetConfig(cfg LoopConfig) {
 	}
 	if cfg.CtxMaxInjectChars > 0 {
 		l.cfg.CtxMaxInjectChars = cfg.CtxMaxInjectChars
+	}
+	if cfg.ToolOutputKeepRounds > 0 {
+		l.cfg.ToolOutputKeepRounds = cfg.ToolOutputKeepRounds
+	}
+	if cfg.MaxContextTokens > 0 {
+		l.cfg.MaxContextTokens = cfg.MaxContextTokens
+	}
+	if cfg.CompactionThreshold > 0 {
+		l.cfg.CompactionThreshold = cfg.CompactionThreshold
+	}
+	if cfg.CompactionTailMessages > 0 {
+		l.cfg.CompactionTailMessages = cfg.CompactionTailMessages
 	}
 }
 
@@ -160,6 +191,15 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 		if ctx.Err() != nil {
 			sp.stop()
 			return ctx.Err()
+		}
+
+		if l.shouldCompact() {
+			sp.stop()
+			fmt.Fprintf(os.Stderr, "\033[2m[compacting context…]\033[0m\n")
+			if err := l.runCompaction(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "\033[2m[compaction failed: %v]\033[0m\n", err)
+			}
+			sp = l.newSpinnerOrNop()
 		}
 
 		msgs := l.buildMessages()
@@ -293,8 +333,10 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 		}
 	}
 
-	// Trim history to configured window, aligning to a user-message boundary.
-	hist := l.history
+	// Phase 1 — strip verbose tool outputs older than ToolOutputKeepRounds.
+	hist := l.stripOldToolOutputs(l.history)
+
+	// Phase 2a — message-count window (secondary guard).
 	if max := l.cfg.MaxHistoryMessages; max > 0 && len(hist) > max {
 		hist = hist[len(hist)-max:]
 		for len(hist) > 0 && hist[0].Role != "user" {
@@ -302,9 +344,81 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 		}
 	}
 
+	// Phase 2b — token-budget window (primary guard): leave 25% headroom for system prompt.
+	if max := l.cfg.MaxContextTokens; max > 0 {
+		budget := max * 3 / 4
+		for len(hist) > 1 && estimateTokens(hist) > budget {
+			hist = hist[1:]
+			for len(hist) > 0 && hist[0].Role != "user" {
+				hist = hist[1:]
+			}
+		}
+	}
+
 	msgs := make([]llm.ChatMessage, 0, 1+len(hist))
 	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
 	return append(msgs, hist...)
+}
+
+// estimateTokens returns a rough token count for a message slice.
+// Uses 4 chars ≈ 1 token, which is slightly conservative for prose and
+// roughly correct for code. Accurate enough for budget comparisons.
+func estimateTokens(msgs []llm.ChatMessage) int {
+	total := 0
+	for _, m := range msgs {
+		total += len(m.Content) / 4
+		for _, tc := range m.ToolCalls {
+			total += (len(tc.Name) + len(fmt.Sprint(tc.Args))) / 4
+		}
+	}
+	return total
+}
+
+// stripOldToolOutputs replaces the Content of verbose tool result messages
+// that are older than ToolOutputKeepRounds rounds with a short placeholder.
+// Tool-call/result pairs remain structurally intact — only the content is
+// replaced, so the LLM can still follow the exchange sequence.
+func (l *Loop) stripOldToolOutputs(hist []llm.ChatMessage) []llm.ChatMessage {
+	keep := l.cfg.ToolOutputKeepRounds
+	if keep <= 0 || len(hist) == 0 {
+		return hist
+	}
+
+	// Walk backward counting assistant messages (each = one round) to find
+	// the start of the protected tail.
+	rounds := 0
+	tailStart := len(hist)
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i].Role == "assistant" {
+			rounds++
+			if rounds >= keep {
+				tailStart = i
+				break
+			}
+		}
+	}
+	if tailStart == 0 {
+		return hist // everything is in the tail
+	}
+
+	out := make([]llm.ChatMessage, len(hist))
+	copy(out, hist)
+	for i := 0; i < tailStart; i++ {
+		if out[i].Role == "tool" && len(out[i].Content) > 200 {
+			out[i].Content = fmt.Sprintf("[%s result: %d chars — stripped from history]",
+				out[i].ToolName, len(out[i].Content))
+		}
+	}
+	return out
+}
+
+// shouldCompact reports whether the history has grown past the compaction threshold.
+func (l *Loop) shouldCompact() bool {
+	if l.cfg.MaxContextTokens <= 0 || l.cfg.CompactionThreshold <= 0 {
+		return false
+	}
+	threshold := float64(l.cfg.MaxContextTokens) * l.cfg.CompactionThreshold
+	return float64(estimateTokens(l.history)) >= threshold
 }
 
 func (l *Loop) executeTool(ctx context.Context, tc llm.ToolCall) string {
