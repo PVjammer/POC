@@ -34,7 +34,7 @@ type Config struct {
 	MaxHistoryMessages int          `toml:"max_history_messages"`
 	ToolOutputMaxChars int          `toml:"tool_output_max_chars"`
 	ToolOverflow       ToolOverflow `toml:"tool_output_overflow"`
-	CtxMaxInjectChars  int          `toml:"ctx_max_inject_chars"`
+	CtxInlineThreshold int          `toml:"ctx_inline_threshold"` // bytes; slots larger than this become stubs
 	Prompt             PromptConfig `toml:"prompt"`
 
 	// Context / compaction settings.
@@ -50,7 +50,7 @@ func Defaults() Config {
 		MaxHistoryMessages:     20,
 		ToolOutputMaxChars:     4000,
 		ToolOverflow:           OverflowTruncate,
-		CtxMaxInjectChars:      8000,
+		CtxInlineThreshold:     4096,
 		ToolOutputKeepRounds:   3,
 		MaxContextTokens:       8192,
 		CompactionThreshold:    0.75,
@@ -126,8 +126,8 @@ func Load() (Config, error) {
 	if cfg.ToolOverflow != OverflowSummarize {
 		cfg.ToolOverflow = OverflowTruncate
 	}
-	if cfg.CtxMaxInjectChars < 500 {
-		cfg.CtxMaxInjectChars = 500
+	if cfg.CtxInlineThreshold < 256 {
+		cfg.CtxInlineThreshold = 256
 	}
 	if cfg.ToolOutputKeepRounds < 1 {
 		cfg.ToolOutputKeepRounds = 1

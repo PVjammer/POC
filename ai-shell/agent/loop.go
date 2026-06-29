@@ -33,18 +33,30 @@ Answer questions, explain concepts, and guide the user on how to accomplish task
 Provide clear, concise explanations and concrete command examples in code blocks.
 Do not attempt to execute anything — describe what to do instead.`
 
+// CtxSlot is a named context entry passed to the agent.
+// Small slots (Description == "") are injected verbatim into the system prompt.
+// Large slots carry a one-line Description stub; the agent uses read_context() to fetch content.
+type CtxSlot struct {
+	Content     string
+	Description string // non-empty = stub mode
+}
+
+func (s CtxSlot) isStub() bool { return s.Description != "" }
+
 // LoopConfig holds tuneable parameters for the agent loop.
 type LoopConfig struct {
 	MaxHistoryMessages int    // number of messages to keep in context (default 20)
 	ToolOutputMaxChars int    // truncate/summarize tool results above this (default 4000)
 	ToolOverflow       string // "truncate" or "summarize"
-	CtxMaxInjectChars  int    // max chars to inject per context slot (default 8000)
 
 	// Phase 1 — tool output stripping.
 	ToolOutputKeepRounds int // rounds of tool outputs to keep verbatim; older ones are stripped (default 3)
 
 	// Phase 2 — token budget.
 	MaxContextTokens int // model context ceiling in tokens; history trimmed to stay under 75% (default 8192)
+
+	// Phase 3 — ctx slot auto-stub.
+	CtxInlineThreshold int // bytes; slots larger than this are shown as stubs (default 4096)
 
 	// Phase 4 — LLM compaction.
 	CompactionThreshold    float64 // fire compaction at this fraction of MaxContextTokens (default 0.75)
@@ -56,9 +68,9 @@ func defaultLoopConfig() LoopConfig {
 		MaxHistoryMessages:     20,
 		ToolOutputMaxChars:     4000,
 		ToolOverflow:           "truncate",
-		CtxMaxInjectChars:      8000,
 		ToolOutputKeepRounds:   3,
 		MaxContextTokens:       8192,
+		CtxInlineThreshold:     4096,
 		CompactionThreshold:    0.75,
 		CompactionTailMessages: 20,
 	}
@@ -81,7 +93,7 @@ type Loop struct {
 	handlers       map[string]func(map[string]interface{}) (string, error)
 	history        []llm.ChatMessage
 	shellCtx       ShellContext
-	contextSlots   map[string]string
+	contextSlots   map[string]CtxSlot
 	cfg            LoopConfig
 	spinnerEnabled bool
 	systemPrompt   string // empty = use baseSystemPrompt
@@ -115,7 +127,10 @@ func New(
 func (l *Loop) SetShellContext(ctx ShellContext) { l.shellCtx = ctx }
 
 // SetContextSlots updates named context content injected into the system prompt.
-func (l *Loop) SetContextSlots(slots map[string]string) { l.contextSlots = slots }
+func (l *Loop) SetContextSlots(slots map[string]CtxSlot) { l.contextSlots = slots }
+
+// ToolDefs returns the current tool definitions (used by the describe_tool handler).
+func (l *Loop) ToolDefs() []llm.ToolDef { return l.tools }
 
 // SetConfig updates tuneable loop parameters.
 func (l *Loop) SetConfig(cfg LoopConfig) {
@@ -128,8 +143,8 @@ func (l *Loop) SetConfig(cfg LoopConfig) {
 	if cfg.ToolOverflow != "" {
 		l.cfg.ToolOverflow = cfg.ToolOverflow
 	}
-	if cfg.CtxMaxInjectChars > 0 {
-		l.cfg.CtxMaxInjectChars = cfg.CtxMaxInjectChars
+	if cfg.CtxInlineThreshold > 0 {
+		l.cfg.CtxInlineThreshold = cfg.CtxInlineThreshold
 	}
 	if cfg.ToolOutputKeepRounds > 0 {
 		l.cfg.ToolOutputKeepRounds = cfg.ToolOutputKeepRounds
@@ -153,6 +168,29 @@ func (l *Loop) SetTools(tools []llm.ToolDef, handlers map[string]func(map[string
 
 // SetProvider replaces the LLM provider (called when the model is switched mid-session).
 func (l *Loop) SetProvider(p llm.ToolCallingProvider) { l.provider = p }
+
+// RunOneShot makes a single streaming LLM call with the given system and user
+// messages. It does NOT read or write conversation history, does NOT trigger
+// compaction, and does NOT use any tools. Designed for focused one-shot tasks
+// (commit messages, summaries, etc.) that should not pollute the session.
+func (l *Loop) RunOneShot(ctx context.Context, systemPrompt, userMsg string, onToken func(string)) error {
+	msgs := []llm.ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userMsg},
+	}
+	sp := l.newSpinnerOrNop()
+	ch := l.provider.ChatMessages(ctx, msgs, llm.DefaultOptions())
+	sp.stop()
+	for chunk := range ch {
+		if chunk.Error != nil {
+			return fmt.Errorf("llm: %w", chunk.Error)
+		}
+		if chunk.Text != "" && onToken != nil {
+			onToken(chunk.Text)
+		}
+	}
+	return nil
+}
 
 // SetSpinnerEnabled controls whether a spinner is shown during LLM waits.
 // Disable for background execution to avoid corrupting the foreground terminal.
@@ -319,16 +357,16 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 		}
 	}
 
-	// Active context slots — capped to CtxMaxInjectChars per slot.
+	// Active context slots — small slots injected verbatim, large slots as stubs.
 	if len(l.contextSlots) > 0 {
 		sys += "\n\nActive context:"
-		for name, content := range l.contextSlots {
-			cap := l.cfg.CtxMaxInjectChars
-			if cap > 0 && len(content) > cap {
-				sys += fmt.Sprintf("\n--- %s (%d chars total, showing first %d) ---\n%s\n[... truncated]",
-					name, len(content), cap, content[:cap])
+		for name, slot := range l.contextSlots {
+			if slot.isStub() {
+				sys += fmt.Sprintf("\n--- %s [%s, stub] ---\n%s",
+					name, humanSize(len(slot.Content)), slot.Description)
 			} else {
-				sys += fmt.Sprintf("\n--- %s (%d chars) ---\n%s", name, len(content), content)
+				sys += fmt.Sprintf("\n--- %s (%s) ---\n%s",
+					name, humanSize(len(slot.Content)), slot.Content)
 			}
 		}
 	}
@@ -358,6 +396,18 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 	msgs := make([]llm.ChatMessage, 0, 1+len(hist))
 	msgs = append(msgs, llm.ChatMessage{Role: "system", Content: sys})
 	return append(msgs, hist...)
+}
+
+// humanSize formats a byte count as a human-readable string.
+func humanSize(n int) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%dB", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	}
 }
 
 // estimateTokens returns a rough token count for a message slice.

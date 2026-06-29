@@ -3,6 +3,7 @@ package shell
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,6 +23,12 @@ import (
 	"github.com/pvjammer/ai-shell-poc/tools"
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
+
+// shellCtxSlot is the shell-side representation of a named context slot.
+type shellCtxSlot struct {
+	content string
+	desc    string // empty = auto-generate stub description; non-empty = user-provided
+}
 
 // Config holds runtime configuration for the shell (LLM connection).
 type Config struct {
@@ -44,7 +51,7 @@ type Shell struct {
 	actTools    []llm.ToolDef
 	actHandlers map[string]func(map[string]interface{}) (string, error)
 
-	ctxSlots     map[string]string
+	ctxSlots     map[string]shellCtxSlot
 	lastCmd      string
 	lastExitCode int
 	lastStderr   string
@@ -97,22 +104,28 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		return nil, fmt.Errorf("create readline: %w", err)
 	}
 
-	ctxSlots, err := config.LoadContexts()
+	rawSlots, err := config.LoadContexts()
 	if err != nil {
-		ctxSlots = make(map[string]string)
+		rawSlots = make(map[string]string)
+	}
+	shellSlots := make(map[string]shellCtxSlot, len(rawSlots))
+	for name, content := range rawSlots {
+		shellSlots[name] = shellCtxSlot{content: content}
 	}
 
-	return &Shell{
+	s := &Shell{
 		cfg:         cfg,
 		appCfg:      appCfg,
 		rl:          rl,
 		agent:       agentLoop,
 		fnLoader:    fnLoader,
 		jobs:        newJobManager(),
-		ctxSlots:    ctxSlots,
+		ctxSlots:    shellSlots,
 		actTools:    allTools,
 		actHandlers: allHandlers,
-	}, nil
+	}
+	s.wireContextTools()
+	return s, nil
 }
 
 // Run starts the interactive loop and blocks until the user exits.
@@ -407,11 +420,11 @@ func (s *Shell) runMetaCapture(cmd string) (string, error) {
 			return "", fmt.Errorf("/ctx: pipe usage: /ctx show <name>")
 		}
 		name := parts[2]
-		v, ok := s.ctxSlots[name]
+		slot, ok := s.ctxSlots[name]
 		if !ok {
 			return "", fmt.Errorf("/ctx: no slot %q  (try /ctx list)", name)
 		}
-		return v, nil
+		return slot.content, nil
 	}
 	return "", fmt.Errorf("/%s: not pipeable — only /job and /ctx show can feed a pipeline", parts[0])
 }
@@ -523,6 +536,9 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 	case "permissions", "perm":
 		s.runPermissions(args)
 
+	case "commit-msg", "commit", "cm":
+		s.runCommitMsg()
+
 	case "exit", "quit", "q":
 		return true
 
@@ -578,53 +594,41 @@ func (s *Shell) runCtx(args []string, piped string) {
 			fmt.Fprintln(os.Stderr, "ctx: pipe content into /ctx set — e.g. cat file.md | /ctx set design")
 			return
 		}
-		s.ctxSlots[slotName] = strings.TrimSpace(piped)
-		size := len(s.ctxSlots[slotName])
+		content := strings.TrimSpace(piped)
+		s.ctxSlots[slotName] = shellCtxSlot{content: content}
 
 		if slotName != "default" {
-			if err := config.SaveContext(slotName, s.ctxSlots[slotName]); err != nil {
+			if err := config.SaveContext(slotName, content); err != nil {
 				fmt.Fprintf(os.Stderr, "ctx: warning: could not persist slot: %v\n", err)
 			}
 		}
-
-		cap := s.appCfg.CtxMaxInjectChars
-		if cap > 0 && size > cap {
-			fmt.Printf("ctx: set %q (%d chars) — only first %d chars will be injected per turn; use /ctx show %s for full content\n",
-				slotName, size, cap, slotName)
-		} else {
-			fmt.Printf("ctx: set %q (%d chars)\n", slotName, size)
-		}
+		s.printCtxFeedback("set", slotName, len(content))
 
 	case "add":
 		if strings.TrimSpace(piped) == "" {
 			fmt.Fprintln(os.Stderr, "ctx: pipe content into /ctx add — e.g. cat file.md | /ctx add docs")
 			return
 		}
-		content := strings.TrimSpace(piped)
-		if existing, ok := s.ctxSlots[slotName]; ok && existing != "" {
-			s.ctxSlots[slotName] = existing + "\n\n" + content
+		incoming := strings.TrimSpace(piped)
+		existing := s.ctxSlots[slotName]
+		var merged string
+		if existing.content != "" {
+			merged = existing.content + "\n\n" + incoming
 		} else {
-			s.ctxSlots[slotName] = content
+			merged = incoming
 		}
-		size := len(s.ctxSlots[slotName])
+		s.ctxSlots[slotName] = shellCtxSlot{content: merged, desc: existing.desc}
 
 		if slotName != "default" {
-			if err := config.SaveContext(slotName, s.ctxSlots[slotName]); err != nil {
+			if err := config.SaveContext(slotName, merged); err != nil {
 				fmt.Fprintf(os.Stderr, "ctx: warning: could not persist slot: %v\n", err)
 			}
 		}
-
-		cap := s.appCfg.CtxMaxInjectChars
-		if cap > 0 && size > cap {
-			fmt.Printf("ctx: appended to %q (%d chars total) — only first %d chars will be injected per turn\n",
-				slotName, size, cap)
-		} else {
-			fmt.Printf("ctx: appended to %q (%d chars total)\n", slotName, size)
-		}
+		s.printCtxFeedback("appended to", slotName, len(merged))
 
 	case "show":
-		if v, ok := s.ctxSlots[slotName]; ok {
-			fmt.Println(v)
+		if slot, ok := s.ctxSlots[slotName]; ok {
+			fmt.Println(slot.content)
 		} else {
 			fmt.Fprintf(os.Stderr, "ctx: no slot %q  (try /ctx list)\n", slotName)
 		}
@@ -634,8 +638,13 @@ func (s *Shell) runCtx(args []string, piped string) {
 			fmt.Println("(no context slots)")
 			return
 		}
-		for k, v := range s.ctxSlots {
-			fmt.Printf("  %-20s %d chars\n", k, len(v))
+		threshold := s.appCfg.CtxInlineThreshold
+		for k, slot := range s.ctxSlots {
+			mode := "inline"
+			if len(slot.content) > threshold {
+				mode = "stub"
+			}
+			fmt.Printf("  %-20s  %-8s  %s\n", k, humanSize(len(slot.content)), mode)
 		}
 
 	case "clear":
@@ -648,7 +657,9 @@ func (s *Shell) runCtx(args []string, piped string) {
 			}
 			fmt.Printf("ctx: cleared %q\n", slotName)
 		} else {
-			s.ctxSlots = make(map[string]string)
+			for k := range s.ctxSlots {
+				delete(s.ctxSlots, k)
+			}
 			if err := config.ClearContexts(); err != nil {
 				fmt.Fprintf(os.Stderr, "ctx: warning: could not clear persisted slots: %v\n", err)
 			}
@@ -668,7 +679,7 @@ func (s *Shell) runConfig(args []string) {
 		fmt.Printf("  %-30s %v\n", "max_history_messages", s.appCfg.MaxHistoryMessages)
 		fmt.Printf("  %-30s %v\n", "tool_output_max_chars", s.appCfg.ToolOutputMaxChars)
 		fmt.Printf("  %-30s %v\n", "tool_output_overflow", s.appCfg.ToolOverflow)
-		fmt.Printf("  %-30s %v\n", "ctx_max_inject_chars", s.appCfg.CtxMaxInjectChars)
+		fmt.Printf("  %-30s %v\n", "ctx_inline_threshold", s.appCfg.CtxInlineThreshold)
 		fmt.Printf("  %-30s %v\n", "tool_output_keep_rounds", s.appCfg.ToolOutputKeepRounds)
 		fmt.Printf("  %-30s %v\n", "max_context_tokens", s.appCfg.MaxContextTokens)
 		fmt.Printf("  %-30s %v\n", "compaction_threshold", s.appCfg.CompactionThreshold)
@@ -716,13 +727,13 @@ func (s *Shell) runConfig(args []string) {
 				return
 			}
 			s.appCfg.ToolOverflow = config.ToolOverflow(val)
-		case "ctx_max_inject_chars":
+		case "ctx_inline_threshold":
 			n, err := strconv.Atoi(val)
-			if err != nil || n < 500 {
-				fmt.Fprintln(os.Stderr, "config: ctx_max_inject_chars must be an integer >= 500")
+			if err != nil || n < 256 {
+				fmt.Fprintln(os.Stderr, "config: ctx_inline_threshold must be an integer >= 256")
 				return
 			}
-			s.appCfg.CtxMaxInjectChars = n
+			s.appCfg.CtxInlineThreshold = n
 		case "tool_output_keep_rounds":
 			n, err := strconv.Atoi(val)
 			if err != nil || n < 1 {
@@ -846,6 +857,7 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /job <N> | /fn     pipe job output into a function")
 	fmt.Println("  /job <N> | ?msg    pipe job output to advisory AI")
 	fmt.Println("  /job <N> | /ctx add <name>  store job output in context")
+	fmt.Println("  /commit-msg        generate a commit message from staged git changes")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model and endpoint")
@@ -1042,12 +1054,24 @@ func (s *Shell) syncAgentContext() {
 		LastExitCode: s.lastExitCode,
 		LastStderr:   s.lastStderr,
 	})
-	s.agent.SetContextSlots(s.ctxSlots)
+	threshold := s.appCfg.CtxInlineThreshold
+	agentSlots := make(map[string]agent.CtxSlot, len(s.ctxSlots))
+	for name, slot := range s.ctxSlots {
+		if len(slot.content) <= threshold {
+			agentSlots[name] = agent.CtxSlot{Content: slot.content}
+		} else {
+			agentSlots[name] = agent.CtxSlot{
+				Content:     slot.content,
+				Description: s.slotDesc(name, slot),
+			}
+		}
+	}
+	s.agent.SetContextSlots(agentSlots)
 	s.agent.SetConfig(agent.LoopConfig{
 		MaxHistoryMessages:     s.appCfg.MaxHistoryMessages,
 		ToolOutputMaxChars:     s.appCfg.ToolOutputMaxChars,
 		ToolOverflow:           string(s.appCfg.ToolOverflow),
-		CtxMaxInjectChars:      s.appCfg.CtxMaxInjectChars,
+		CtxInlineThreshold:     s.appCfg.CtxInlineThreshold,
 		ToolOutputKeepRounds:   s.appCfg.ToolOutputKeepRounds,
 		MaxContextTokens:       s.appCfg.MaxContextTokens,
 		CompactionThreshold:    s.appCfg.CompactionThreshold,
@@ -1072,11 +1096,195 @@ func (s *Shell) setModel(model, endpoint string) error {
 	for k, v := range s.fnLoader.ToolHandlers() {
 		allHandlers[k] = v
 	}
-	s.agent.SetTools(allTools, allHandlers)
+	s.actTools = allTools
+	s.actHandlers = allHandlers
+	s.wireContextTools()
 
 	s.cfg.Model = model
 	s.cfg.Endpoint = endpoint
 	return nil
+}
+
+// ── Commit message generation ─────────────────────────────────────────────────
+
+// runCommitMsg generates a commit message from staged git changes.
+func (s *Shell) runCommitMsg() {
+	out, err := exec.Command("git", "diff", "--staged").Output()
+	if err != nil {
+		// Distinguish "not a git repo" from other errors.
+		if _, statErr := exec.Command("git", "rev-parse", "--git-dir").Output(); statErr != nil {
+			fmt.Fprintln(os.Stderr, "commit-msg: not a git repository")
+		} else {
+			fmt.Fprintf(os.Stderr, "commit-msg: git diff failed: %v\n", err)
+		}
+		return
+	}
+
+	diff := strings.TrimSpace(string(out))
+	if diff == "" {
+		// Help the user understand why nothing is staged.
+		unstaged, _ := exec.Command("git", "diff", "--name-only").Output()
+		untracked, _ := exec.Command("git", "ls-files", "--others", "--exclude-standard").Output()
+		switch {
+		case len(strings.TrimSpace(string(unstaged))) > 0:
+			fmt.Fprintln(os.Stderr, "commit-msg: nothing staged — you have unstaged changes (run 'git add' first)")
+		case len(strings.TrimSpace(string(untracked))) > 0:
+			fmt.Fprintln(os.Stderr, "commit-msg: nothing staged — you have untracked files (run 'git add' first)")
+		default:
+			fmt.Fprintln(os.Stderr, "commit-msg: nothing staged and working tree is clean")
+		}
+		return
+	}
+
+	const maxDiffChars = 12000
+	truncationNote := ""
+	if len(diff) > maxDiffChars {
+		truncationNote = fmt.Sprintf("\n[diff truncated — showing first %d of %d chars]\n", maxDiffChars, len(diff))
+		diff = diff[:maxDiffChars]
+	}
+
+	const systemPrompt = `You are an expert at writing clear, informative git commit messages.
+Analyse the staged diff and produce a commit message.
+Rules:
+- Subject line: imperative mood, ≤72 chars, no trailing period
+- Detect and follow conventional commits style if the project uses it (feat/fix/refactor/chore/docs/test/etc.)
+- If the change is non-trivial: blank line, then a short body explaining WHY (the diff already shows what)
+- Output ONLY the commit message — no preamble, no explanation, no markdown fences`
+
+	userMsg := fmt.Sprintf("Staged diff:%s\n\n%s", truncationNote, diff)
+
+	s.agentMu.Lock()
+	defer s.agentMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() { <-sigCh; cancel() }()
+
+	fmt.Println()
+	err = s.agent.RunOneShot(ctx, systemPrompt, userMsg, func(token string) { fmt.Print(token) })
+	fmt.Println()
+	if err != nil && err != context.Canceled {
+		fmt.Fprintf(os.Stderr, "commit-msg: %v\n", err)
+	}
+}
+
+// ── Context tools ─────────────────────────────────────────────────────────────
+
+// wireContextTools adds the read_context and describe_tool handlers and tool
+// defs to s.actTools/s.actHandlers. Called from New() and setModel().
+// Closures capture s so they always see the current ctxSlots and agent.
+func (s *Shell) wireContextTools() {
+	s.actTools = append(s.actTools, tools.ReadContextToolDef(), tools.DescribeToolToolDef())
+
+	s.actHandlers["read_context"] = func(args map[string]interface{}) (string, error) {
+		name, _ := args["name"].(string)
+		slot, ok := s.ctxSlots[name]
+		if !ok {
+			return "", fmt.Errorf("no context slot %q (try /ctx list)", name)
+		}
+		if query, _ := args["query"].(string); query != "" {
+			return filterContent(slot.content, query), nil
+		}
+		return slot.content, nil
+	}
+
+	s.actHandlers["describe_tool"] = func(args map[string]interface{}) (string, error) {
+		name, _ := args["name"].(string)
+		for _, td := range s.agent.ToolDefs() {
+			if td.Name == name {
+				b, err := json.Marshal(td)
+				if err != nil {
+					return "", err
+				}
+				return string(b), nil
+			}
+		}
+		return "", fmt.Errorf("unknown tool %q", name)
+	}
+
+	s.agent.SetTools(s.actTools, s.actHandlers)
+}
+
+// slotDesc returns a stub description for a context slot, using the user-provided
+// description if set, otherwise generating one from the slot's content size.
+func (s *Shell) slotDesc(name string, slot shellCtxSlot) string {
+	if slot.desc != "" {
+		return slot.desc
+	}
+	return fmt.Sprintf("%s document. Call read_context(%q) to retrieve.", humanSize(len(slot.content)), name)
+}
+
+// printCtxFeedback prints a summary line after a ctx set/add, showing mode.
+func (s *Shell) printCtxFeedback(verb, name string, size int) {
+	threshold := s.appCfg.CtxInlineThreshold
+	if size > threshold {
+		fmt.Printf("ctx: %s %q (%s) — stub mode; agent will use read_context() to fetch\n",
+			verb, name, humanSize(size))
+	} else {
+		fmt.Printf("ctx: %s %q (%s) — inline\n", verb, name, humanSize(size))
+	}
+}
+
+// humanSize formats a byte count as a human-readable string.
+func humanSize(n int) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%dB", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1fMB", float64(n)/(1024*1024))
+	}
+}
+
+// filterContent returns lines from content that match any word in query,
+// with up to 2 lines of surrounding context around each match.
+func filterContent(content, query string) string {
+	terms := strings.Fields(strings.ToLower(query))
+	if len(terms) == 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	type span struct{ start, end int }
+	var spans []span
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		for _, term := range terms {
+			if strings.Contains(lower, term) {
+				s := i - 2
+				if s < 0 {
+					s = 0
+				}
+				e := i + 3
+				if e > len(lines) {
+					e = len(lines)
+				}
+				spans = append(spans, span{s, e})
+				break
+			}
+		}
+	}
+	if len(spans) == 0 {
+		return fmt.Sprintf("(no lines matching %q)", query)
+	}
+	var out []string
+	prev := -1
+	for _, sp := range spans {
+		if sp.start > prev+1 && prev >= 0 {
+			out = append(out, "---")
+		}
+		if sp.start <= prev {
+			sp.start = prev + 1
+		}
+		if sp.start < sp.end {
+			out = append(out, lines[sp.start:sp.end]...)
+		}
+		prev = sp.end - 1
+	}
+	return strings.Join(out, "\n")
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1325,5 +1533,5 @@ func wordWrap(text string, width int) []string {
 }
 
 func metaCommands() []string {
-	return []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "exit"}
+	return []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "exit"}
 }
