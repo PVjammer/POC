@@ -7,7 +7,7 @@ import "github.com/pvjammer/ai-sdk-go/pkg/llm"
 func ReadContextToolDef() llm.ToolDef {
 	return llm.ToolDef{
 		Name:        "read_context",
-		Description: "Read the full content of a named context slot. Use when a slot is shown as a stub in the system prompt.",
+		Description: "Read the content of a named context slot. Large slots are returned in pages; use offset to continue reading. Use query to search for specific content instead of reading linearly.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -17,7 +17,11 @@ func ReadContextToolDef() llm.ToolDef {
 				},
 				"query": map[string]interface{}{
 					"type":        "string",
-					"description": "Optional: return only lines matching these search terms (with surrounding context) instead of the full content",
+					"description": "Return only lines matching these search terms (with surrounding context). Prefer this over reading linearly when looking for specific information.",
+				},
+				"offset": map[string]interface{}{
+					"type":        "integer",
+					"description": "Byte offset to start reading from. Use the value from the previous call's continuation footer to page through large slots.",
 				},
 			},
 			"required": []string{"name"},

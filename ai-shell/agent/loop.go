@@ -12,6 +12,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -24,14 +25,21 @@ const maxRounds = 15
 const baseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
 Help the user accomplish tasks using shell commands and your own knowledge.
 Be concise. Show relevant output. Prefer doing over explaining.
-Use tools when needed; answer directly when you can.`
+Use tools when needed; answer directly when you can.
 
-// AdvisorySystemPrompt is used for ? (read-only) queries. The agent has no
-// tools in this mode — it answers from knowledge and context only.
+When context slots are shown as stubs in the "Active context" section, call
+read_context() to retrieve their full content BEFORE exploring the filesystem.
+After gathering information with tools, always provide a comprehensive text response.`
+
+// AdvisorySystemPrompt is used for ? (read-only) queries.
+// Advisory mode has access to read_context and describe_tool but not bash.
 const AdvisorySystemPrompt = `You are an AI assistant embedded in a Unix terminal.
 Answer questions, explain concepts, and guide the user on how to accomplish tasks.
 Provide clear, concise explanations and concrete command examples in code blocks.
-Do not attempt to execute anything — describe what to do instead.`
+Do not attempt to execute shell commands — describe what to do instead.
+
+When context slots are shown as stubs in the "Active context" section, call
+read_context() to retrieve their full content before answering.`
 
 // CtxSlot is a named context entry passed to the agent.
 // Small slots (Description == "") are injected verbatim into the system prompt.
@@ -105,6 +113,9 @@ type Loop struct {
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
 	OnToolResult func(name string, result string)
+
+	// debugLog receives a human-readable trace of every LLM call when non-nil.
+	debugLog io.Writer
 }
 
 // New creates a new agent loop with default configuration.
@@ -168,6 +179,10 @@ func (l *Loop) SetTools(tools []llm.ToolDef, handlers map[string]func(map[string
 
 // SetProvider replaces the LLM provider (called when the model is switched mid-session).
 func (l *Loop) SetProvider(p llm.ToolCallingProvider) { l.provider = p }
+
+// SetDebugLog directs a human-readable trace of every LLM call to w.
+// Pass nil to disable. The caller owns the writer's lifecycle.
+func (l *Loop) SetDebugLog(w io.Writer) { l.debugLog = w }
 
 // RunOneShot makes a single streaming LLM call with the given system and user
 // messages. It does NOT read or write conversation history, does NOT trigger
@@ -241,6 +256,9 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 		}
 
 		msgs := l.buildMessages()
+		if l.debugLog != nil {
+			logLLMCall(l.debugLog, round, msgs, l.tools)
+		}
 		ch := l.provider.ChatWithTools(ctx, msgs, l.tools, opts)
 
 		// Drain — ChatWithTools emits one final chunk.
@@ -277,11 +295,17 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 				if l.OnToolCall != nil {
 					l.OnToolCall(tc.Name, tc.Args)
 				}
+				if l.debugLog != nil {
+					logToolCall(l.debugLog, tc.Name, tc.Args)
+				}
 
 				result := l.executeTool(ctx, tc)
 
 				if l.OnToolResult != nil {
 					l.OnToolResult(tc.Name, result)
+				}
+				if l.debugLog != nil {
+					logToolResult(l.debugLog, tc.Name, result)
 				}
 
 				l.history = append(l.history, llm.ChatMessage{
@@ -298,6 +322,9 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 
 		// ── Text response ─────────────────────────────────────────────────
 		if final.Text != "" {
+			if l.debugLog != nil {
+				logResponse(l.debugLog, final.Text)
+			}
 			onToken(final.Text)
 			l.history = append(l.history, llm.ChatMessage{
 				Role:    "assistant",

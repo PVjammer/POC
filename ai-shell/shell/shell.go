@@ -83,6 +83,14 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		ToolOverflow:       string(appCfg.ToolOverflow),
 	})
 
+	if os.Getenv("BAISH_DEBUG") != "" {
+		logPath := config.Path()[:len(config.Path())-len("config.toml")] + "debug.log"
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			agentLoop.SetDebugLog(f)
+			fmt.Fprintf(os.Stderr, "\033[2m[debug] logging to %s\033[0m\n", logPath)
+		}
+	}
+
 	agentLoop.OnToolCall = func(name string, args map[string]interface{}) {
 		if cmd, ok := args["command"]; ok {
 			fmt.Fprintf(os.Stderr, "\033[2m  [%s] $ %v\033[0m\n", name, cmd)
@@ -269,14 +277,46 @@ func (s *Shell) runDirect(cmdStr string) {
 
 // setupAgentForMode configures tools and system prompt for advisory (?) or
 // agentic (!) mode. Must be called with agentMu held.
+//
+// Advisory mode gets read_context and describe_tool — enough to resolve
+// stub context slots without granting execution capabilities.
 func (s *Shell) setupAgentForMode(act bool) {
 	if act {
 		s.agent.SetTools(s.actTools, s.actHandlers)
 		s.agent.SetSystemPrompt("") // use agent package default (agentic)
 	} else {
-		s.agent.SetTools(nil, nil)
+		s.agent.SetTools(s.advisoryToolSet(), s.actHandlers)
 		s.agent.SetSystemPrompt(agent.AdvisorySystemPrompt)
 	}
+}
+
+// advisoryToolAllowlist is the explicit set of tools permitted in advisory (?)
+// mode. Tools must be reviewed before being added here — new tools loaded from
+// the function registry are agentic-only by default.
+var advisoryToolAllowlist = map[string]bool{
+	// Context / introspection (baish built-ins, always safe).
+	"read_context": true,
+	"describe_tool": true,
+	// Filesystem reads (no mutation).
+	"read_file":  true,
+	"list_files": true,
+	// Web (read-only network access).
+	"web_search": true,
+	// Pure text computation (no I/O).
+	"summarize":       true,
+	"extract_data":    true,
+	"text_transform":  true,
+}
+
+// advisoryToolSet returns the subset of actTools permitted in advisory mode.
+func (s *Shell) advisoryToolSet() []llm.ToolDef {
+	var out []llm.ToolDef
+	for _, t := range s.actTools {
+		if advisoryToolAllowlist[t.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // runAgentForeground is the shared foreground agent runner for both modes.
@@ -1306,10 +1346,38 @@ func (s *Shell) wireContextTools() {
 		if !ok {
 			return "", fmt.Errorf("no context slot %q (try /ctx list)", name)
 		}
+		// Filtered read: return matching lines. No pagination needed — results are small.
 		if query, _ := args["query"].(string); query != "" {
 			return filterContent(slot.content, query), nil
 		}
-		return slot.content, nil
+		// Unfiltered read: paginate to stay within ToolOutputMaxChars.
+		content := slot.content
+		limit := s.appCfg.ToolOutputMaxChars
+		if limit <= 0 {
+			limit = 4000
+		}
+		offset := 0
+		if v, ok := args["offset"].(float64); ok {
+			offset = int(v)
+		}
+		if offset < 0 || offset >= len(content) {
+			return fmt.Sprintf("[offset %d is out of range; slot is %d bytes]", offset, len(content)), nil
+		}
+		chunk := content[offset:]
+		if len(chunk) <= limit {
+			if offset > 0 {
+				return fmt.Sprintf("[bytes %d–%d of %d]\n\n%s", offset, offset+len(chunk), len(content), chunk), nil
+			}
+			return chunk, nil
+		}
+		// Find a clean line break near the limit to avoid cutting mid-line.
+		end := offset + limit
+		if nl := strings.LastIndexByte(content[offset:end], '\n'); nl > 0 {
+			end = offset + nl + 1
+		}
+		page := content[offset:end]
+		return fmt.Sprintf("%s\n\n[bytes %d–%d of %d — call read_context(%q, offset=%d) to continue]",
+			page, offset, end, len(content), name, end), nil
 	}
 
 	s.actHandlers["describe_tool"] = func(args map[string]interface{}) (string, error) {
