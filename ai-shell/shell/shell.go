@@ -1192,7 +1192,7 @@ func (s *Shell) promptCommitAction(message string) {
 	}
 	defer tty.Close()
 
-	fmt.Fprintf(tty, "\n\033[2m[c]ommit  [x] copy to clipboard  [enter] dismiss\033[0m ")
+	fmt.Fprintf(tty, "\n\033[2m[c]ommit  [e]dit  [x] copy to clipboard  [enter] dismiss\033[0m ")
 	sc := bufio.NewScanner(tty)
 	if !sc.Scan() {
 		return
@@ -1201,12 +1201,10 @@ func (s *Shell) promptCommitAction(message string) {
 
 	switch {
 	case choice == "c" || choice == "commit":
-		out, err := exec.Command("git", "commit", "-m", message).CombinedOutput()
-		if len(out) > 0 {
-			fmt.Print(string(out))
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "git commit: %v\n", err)
+		s.gitCommit(message)
+	case choice == "e" || choice == "edit":
+		if edited, ok := editInEditor(message); ok {
+			s.gitCommit(edited)
 		}
 	case choice == "x" || choice == "copy":
 		if err := copyToClipboard(message); err != nil {
@@ -1215,6 +1213,64 @@ func (s *Shell) promptCommitAction(message string) {
 			fmt.Println("copied to clipboard")
 		}
 	}
+}
+
+// gitCommit runs git commit -m with the given message.
+func (s *Shell) gitCommit(message string) {
+	out, err := exec.Command("git", "commit", "-m", message).CombinedOutput()
+	if len(out) > 0 {
+		fmt.Print(string(out))
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "git commit: %v\n", err)
+	}
+}
+
+// editInEditor opens message in $VISUAL/$EDITOR for the user to edit.
+// Returns the edited text and true if the user saved a non-empty result;
+// false if the editor exited non-zero or the file was emptied.
+func editInEditor(message string) (string, bool) {
+	tmp, err := os.CreateTemp("", "baish-commit-*.txt")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "edit: %v\n", err)
+		return "", false
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.WriteString(message + "\n"); err != nil {
+		fmt.Fprintf(os.Stderr, "edit: %v\n", err)
+		return "", false
+	}
+	tmp.Close()
+
+	editor := os.Getenv("VISUAL")
+	if editor == "" {
+		editor = os.Getenv("EDITOR")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+
+	cmd := exec.Command(editor, tmp.Name())
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "edit: editor exited with error: %v\n", err)
+		return "", false
+	}
+
+	data, err := os.ReadFile(tmp.Name())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "edit: %v\n", err)
+		return "", false
+	}
+	edited := strings.TrimSpace(string(data))
+	if edited == "" {
+		fmt.Fprintln(os.Stderr, "edit: empty message, commit cancelled")
+		return "", false
+	}
+	return edited, true
 }
 
 // copyToClipboard writes text to the system clipboard using whatever tool is
