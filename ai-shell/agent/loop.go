@@ -180,6 +180,18 @@ func (l *Loop) SetTools(tools []llm.ToolDef, handlers map[string]func(map[string
 // SetProvider replaces the LLM provider (called when the model is switched mid-session).
 func (l *Loop) SetProvider(p llm.ToolCallingProvider) { l.provider = p }
 
+// CopyHistory returns a deep copy of the conversation history.
+// Used by session forking to snapshot history at the fork point.
+func (l *Loop) CopyHistory() []llm.ChatMessage {
+	cp := make([]llm.ChatMessage, len(l.history))
+	copy(cp, l.history)
+	return cp
+}
+
+// SetHistory replaces the conversation history. Used when initialising a
+// forked session with the parent's history snapshot.
+func (l *Loop) SetHistory(h []llm.ChatMessage) { l.history = h }
+
 // SetDebugLog directs a human-readable trace of every LLM call to w.
 // Pass nil to disable. The caller owns the writer's lifecycle.
 func (l *Loop) SetDebugLog(w io.Writer) { l.debugLog = w }

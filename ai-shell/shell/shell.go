@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -42,17 +40,19 @@ type Shell struct {
 	cfg      Config
 	appCfg   config.Config
 	rl       *readline.Instance
-	agent    *agent.Loop
-	agentMu  sync.Mutex
 	fnLoader *functions.Loader
 	jobs     *jobManager
 
-	// actTools/actHandlers are the full tool set for ! (agentic) mode.
-	// Advisory (?) mode uses nil tools so the model cannot call anything.
+	// actTools/actHandlers hold the shared tool definitions and stateless
+	// handlers. Session-specific handlers (read_context, describe_tool) are
+	// created per session in makeSessionHandlers.
 	actTools    []llm.ToolDef
 	actHandlers map[string]func(map[string]interface{}) (string, error)
 
-	ctxSlots     map[string]shellCtxSlot
+	// sessions holds all named conversation sessions. "main" always exists.
+	sessions      map[string]*sessionEntry
+	activeSession string
+
 	lastCmd      string
 	lastExitCode int
 	lastStderr   string
@@ -60,49 +60,27 @@ type Shell struct {
 
 // New creates and wires up the shell.
 func New(cfg Config, appCfg config.Config) (*Shell, error) {
-	provider, err := llm.NewOllamaProvider(cfg.Endpoint, cfg.Model)
-	if err != nil {
-		return nil, fmt.Errorf("create llm provider: %w", err)
-	}
-
 	fnLoader := functions.New(functions.ShellConfig{
 		LLMEndpoint: cfg.Endpoint,
 		LLMModel:    cfg.Model,
 	})
 
+	// Build shared tool definitions. read_context/describe_tool defs are
+	// included here; their handlers are session-specific (see makeSessionHandlers).
 	allTools := append(tools.AllTools(), fnLoader.ToolDefs()...)
-	allHandlers := tools.AllHandlers()
+	allTools = append(allTools, tools.ReadContextToolDef(), tools.DescribeToolToolDef())
+
+	// Base handlers — stateless tools only. Session-specific handlers are
+	// created per session in makeSessionHandlers.
+	baseHandlers := tools.AllHandlers()
 	for k, v := range fnLoader.ToolHandlers() {
-		allHandlers[k] = v
-	}
-
-	agentLoop := agent.New(provider, allTools, allHandlers)
-	agentLoop.SetConfig(agent.LoopConfig{
-		MaxHistoryMessages: appCfg.MaxHistoryMessages,
-		ToolOutputMaxChars: appCfg.ToolOutputMaxChars,
-		ToolOverflow:       string(appCfg.ToolOverflow),
-	})
-
-	if os.Getenv("BAISH_DEBUG") != "" {
-		logPath := config.Path()[:len(config.Path())-len("config.toml")] + "debug.log"
-		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
-			agentLoop.SetDebugLog(f)
-			fmt.Fprintf(os.Stderr, "\033[2m[debug] logging to %s\033[0m\n", logPath)
-		}
-	}
-
-	agentLoop.OnToolCall = func(name string, args map[string]interface{}) {
-		if cmd, ok := args["command"]; ok {
-			fmt.Fprintf(os.Stderr, "\033[2m  [%s] $ %v\033[0m\n", name, cmd)
-		} else {
-			fmt.Fprintf(os.Stderr, "\033[2m  [%s] %v\033[0m\n", name, args)
-		}
+		baseHandlers[k] = v
 	}
 
 	completer := NewHybridCompleter(append(metaCommands(), fnLoader.Names()...))
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            buildPrompt(nil, appCfg.Prompt),
+		Prompt:            buildPrompt(nil, appCfg.Prompt, ""),
 		HistoryFile:       filepath.Join(os.Getenv("HOME"), ".ai_shell_history"),
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
@@ -123,17 +101,31 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	}
 
 	s := &Shell{
-		cfg:         cfg,
-		appCfg:      appCfg,
-		rl:          rl,
-		agent:       agentLoop,
-		fnLoader:    fnLoader,
-		jobs:        newJobManager(),
-		ctxSlots:    shellSlots,
-		actTools:    allTools,
-		actHandlers: allHandlers,
+		cfg:           cfg,
+		appCfg:        appCfg,
+		rl:            rl,
+		fnLoader:      fnLoader,
+		jobs:          newJobManager(),
+		actTools:      allTools,
+		actHandlers:   baseHandlers,
+		sessions:      make(map[string]*sessionEntry),
+		activeSession: "main",
 	}
-	s.wireContextTools()
+
+	// Create the main session.
+	mainSess, err := s.createSession("main", "", nil, shellSlots, 0)
+	if err != nil {
+		return nil, fmt.Errorf("create main session: %w", err)
+	}
+
+	if os.Getenv("BAISH_DEBUG") != "" {
+		logPath := config.Path()[:len(config.Path())-len("config.toml")] + "debug.log"
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			mainSess.loop.SetDebugLog(f)
+			fmt.Fprintf(os.Stderr, "\033[2m[debug] logging to %s\033[0m\n", logPath)
+		}
+	}
+
 	return s, nil
 }
 
@@ -154,7 +146,7 @@ func (s *Shell) Run() error {
 		for _, msg := range s.jobs.drain() {
 			fmt.Println(msg)
 		}
-		s.rl.SetPrompt(buildPrompt(s.jobs, s.appCfg.Prompt))
+		s.rl.SetPrompt(buildPrompt(s.jobs, s.appCfg.Prompt, s.activeSession))
 
 		line, err := s.rl.Readline()
 		if err != nil {
@@ -281,12 +273,15 @@ func (s *Shell) runDirect(cmdStr string) {
 // Advisory mode gets read_context and describe_tool — enough to resolve
 // stub context slots without granting execution capabilities.
 func (s *Shell) setupAgentForMode(act bool) {
+	sess := s.currentSession()
+	handlers := s.makeSessionHandlers(sess)
 	if act {
-		s.agent.SetTools(s.actTools, s.actHandlers)
-		s.agent.SetSystemPrompt("") // use agent package default (agentic)
+		sess.loop.SetTools(s.actTools, handlers)
+		sess.loop.SetSystemPrompt("")
 	} else {
-		s.agent.SetTools(s.advisoryToolSet(), s.actHandlers)
-		s.agent.SetSystemPrompt(agent.AdvisorySystemPrompt)
+		advisoryDefs := s.advisoryToolSet()
+		sess.loop.SetTools(advisoryDefs, handlers)
+		sess.loop.SetSystemPrompt(agent.AdvisorySystemPrompt)
 	}
 }
 
@@ -321,8 +316,8 @@ func (s *Shell) advisoryToolSet() []llm.ToolDef {
 
 // runAgentForeground is the shared foreground agent runner for both modes.
 func (s *Shell) runAgentForeground(msg string, act bool) {
-	s.agentMu.Lock()
-	defer s.agentMu.Unlock()
+	s.sessionMu().Lock()
+	defer s.sessionMu().Unlock()
 	s.setupAgentForMode(act)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -334,7 +329,7 @@ func (s *Shell) runAgentForeground(msg string, act bool) {
 	go func() { <-sigCh; cancel() }()
 
 	fmt.Println()
-	err := s.agent.Run(ctx, msg, func(token string) { fmt.Print(token) })
+	err := s.activeLoop().Run(ctx, msg, func(token string) { fmt.Print(token) })
 	fmt.Println()
 
 	if err != nil && err != context.Canceled {
@@ -349,13 +344,14 @@ func (s *Shell) runAgentAct(msg string) { s.runAgentForeground(msg, true) }
 // Spinner is suppressed — runs in a background goroutine and would corrupt
 // the foreground terminal cursor if allowed to write.
 func (s *Shell) runAgentCapture(ctx context.Context, msg string, act bool) (string, error) {
-	s.agentMu.Lock()
-	defer s.agentMu.Unlock()
-	s.agent.SetSpinnerEnabled(false)
-	defer s.agent.SetSpinnerEnabled(true)
+	sess := s.currentSession() // snapshot at call time — safe for background jobs
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	sess.loop.SetSpinnerEnabled(false)
+	defer sess.loop.SetSpinnerEnabled(true)
 	s.setupAgentForMode(act)
 	var buf strings.Builder
-	err := s.agent.Run(ctx, msg, func(token string) { buf.WriteString(token) })
+	err := sess.loop.Run(ctx, msg, func(token string) { buf.WriteString(token) })
 	return strings.TrimSpace(buf.String()), err
 }
 
@@ -461,7 +457,7 @@ func (s *Shell) runMetaCapture(cmd string) (string, error) {
 			return "", fmt.Errorf("/ctx: pipe usage: /ctx show <name>")
 		}
 		name := parts[2]
-		slot, ok := s.ctxSlots[name]
+		slot, ok := s.currentSession().ctxSlots[name]
 		if !ok {
 			return "", fmt.Errorf("/ctx: no slot %q  (try /ctx list)", name)
 		}
@@ -549,7 +545,7 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 		s.runConfig(args)
 
 	case "clear":
-		s.agent.ClearHistory()
+		s.activeLoop().ClearHistory()
 		fmt.Println("conversation history cleared")
 
 	case "model":
@@ -569,13 +565,16 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 		}
 
 	case "history":
-		fmt.Printf("messages in context: %d\n", s.agent.HistoryLen())
+		fmt.Printf("messages in context: %d\n", s.activeLoop().HistoryLen())
 
 	case "jobs", "job":
 		s.runJobs(args)
 
 	case "permissions", "perm":
 		s.runPermissions(args)
+
+	case "session", "s":
+		s.runSession(args)
 
 	case "commit-msg", "commit", "cm":
 		s.runCommitMsg()
@@ -636,7 +635,7 @@ func (s *Shell) runCtx(args []string, piped string) {
 			return
 		}
 		content := strings.TrimSpace(piped)
-		s.ctxSlots[slotName] = shellCtxSlot{content: content}
+		s.currentSession().ctxSlots[slotName] = shellCtxSlot{content: content}
 
 		if slotName != "default" {
 			if err := config.SaveContext(slotName, content); err != nil {
@@ -651,14 +650,14 @@ func (s *Shell) runCtx(args []string, piped string) {
 			return
 		}
 		incoming := strings.TrimSpace(piped)
-		existing := s.ctxSlots[slotName]
+		existing := s.currentSession().ctxSlots[slotName]
 		var merged string
 		if existing.content != "" {
 			merged = existing.content + "\n\n" + incoming
 		} else {
 			merged = incoming
 		}
-		s.ctxSlots[slotName] = shellCtxSlot{content: merged, desc: existing.desc}
+		s.currentSession().ctxSlots[slotName] = shellCtxSlot{content: merged, desc: existing.desc}
 
 		if slotName != "default" {
 			if err := config.SaveContext(slotName, merged); err != nil {
@@ -668,19 +667,20 @@ func (s *Shell) runCtx(args []string, piped string) {
 		s.printCtxFeedback("appended to", slotName, len(merged))
 
 	case "show":
-		if slot, ok := s.ctxSlots[slotName]; ok {
+		if slot, ok := s.currentSession().ctxSlots[slotName]; ok {
 			fmt.Println(slot.content)
 		} else {
 			fmt.Fprintf(os.Stderr, "ctx: no slot %q  (try /ctx list)\n", slotName)
 		}
 
 	case "list":
-		if len(s.ctxSlots) == 0 {
+		slots := s.currentSession().ctxSlots
+		if len(slots) == 0 {
 			fmt.Println("(no context slots)")
 			return
 		}
 		threshold := s.appCfg.CtxInlineThreshold
-		for k, slot := range s.ctxSlots {
+		for k, slot := range slots {
 			mode := "inline"
 			if len(slot.content) > threshold {
 				mode = "stub"
@@ -689,8 +689,9 @@ func (s *Shell) runCtx(args []string, piped string) {
 		}
 
 	case "clear":
+		ctxSlots := s.currentSession().ctxSlots
 		if len(args) > 1 {
-			delete(s.ctxSlots, slotName)
+			delete(ctxSlots, slotName)
 			if slotName != "default" {
 				if err := config.DeleteContext(slotName); err != nil {
 					fmt.Fprintf(os.Stderr, "ctx: warning: could not remove persisted slot: %v\n", err)
@@ -698,8 +699,8 @@ func (s *Shell) runCtx(args []string, piped string) {
 			}
 			fmt.Printf("ctx: cleared %q\n", slotName)
 		} else {
-			for k := range s.ctxSlots {
-				delete(s.ctxSlots, k)
+			for k := range ctxSlots {
+				delete(ctxSlots, k)
 			}
 			if err := config.ClearContexts(); err != nil {
 				fmt.Fprintf(os.Stderr, "ctx: warning: could not clear persisted slots: %v\n", err)
@@ -1086,18 +1087,19 @@ func (s *Shell) runPermissions(args []string) {
 	fmt.Printf("  %-12s %s\n", tier, cmd)
 }
 
-// syncAgentContext pushes current shell state into the agent loop.
+// syncAgentContext pushes current shell state into the active session's loop.
 func (s *Shell) syncAgentContext() {
+	sess := s.currentSession()
 	cwd, _ := os.Getwd()
-	s.agent.SetShellContext(agent.ShellContext{
+	sess.loop.SetShellContext(agent.ShellContext{
 		CWD:          cwd,
 		LastCommand:  s.lastCmd,
 		LastExitCode: s.lastExitCode,
 		LastStderr:   s.lastStderr,
 	})
 	threshold := s.appCfg.CtxInlineThreshold
-	agentSlots := make(map[string]agent.CtxSlot, len(s.ctxSlots))
-	for name, slot := range s.ctxSlots {
+	agentSlots := make(map[string]agent.CtxSlot, len(sess.ctxSlots))
+	for name, slot := range sess.ctxSlots {
 		if len(slot.content) <= threshold {
 			agentSlots[name] = agent.CtxSlot{Content: slot.content}
 		} else {
@@ -1107,8 +1109,8 @@ func (s *Shell) syncAgentContext() {
 			}
 		}
 	}
-	s.agent.SetContextSlots(agentSlots)
-	s.agent.SetConfig(agent.LoopConfig{
+	sess.loop.SetContextSlots(agentSlots)
+	sess.loop.SetConfig(agent.LoopConfig{
 		MaxHistoryMessages:     s.appCfg.MaxHistoryMessages,
 		ToolOutputMaxChars:     s.appCfg.ToolOutputMaxChars,
 		ToolOverflow:           string(s.appCfg.ToolOverflow),
@@ -1120,26 +1122,31 @@ func (s *Shell) syncAgentContext() {
 	})
 }
 
-// setModel switches the LLM provider and functions loader to a new model/endpoint.
+// setModel switches the active session's LLM provider and updates the functions
+// loader. Other sessions keep their existing provider.
 func (s *Shell) setModel(model, endpoint string) error {
 	provider, err := llm.NewOllamaProvider(endpoint, model)
 	if err != nil {
 		return fmt.Errorf("create provider: %w", err)
 	}
-	s.agent.SetProvider(provider)
+	s.activeLoop().SetProvider(provider)
 
 	s.fnLoader = functions.New(functions.ShellConfig{
 		LLMEndpoint: endpoint,
 		LLMModel:    model,
 	})
 	allTools := append(tools.AllTools(), s.fnLoader.ToolDefs()...)
-	allHandlers := tools.AllHandlers()
+	allTools = append(allTools, tools.ReadContextToolDef(), tools.DescribeToolToolDef())
+	baseHandlers := tools.AllHandlers()
 	for k, v := range s.fnLoader.ToolHandlers() {
-		allHandlers[k] = v
+		baseHandlers[k] = v
 	}
 	s.actTools = allTools
-	s.actHandlers = allHandlers
-	s.wireContextTools()
+	s.actHandlers = baseHandlers
+
+	// Rewire tools on the active session with the updated tool set.
+	sess := s.currentSession()
+	sess.loop.SetTools(s.actTools, s.makeSessionHandlers(sess))
 
 	s.cfg.Model = model
 	s.cfg.Endpoint = endpoint
@@ -1194,8 +1201,8 @@ Rules:
 
 	userMsg := fmt.Sprintf("Staged diff:%s\n\n%s", truncationNote, diff)
 
-	s.agentMu.Lock()
-	defer s.agentMu.Unlock()
+	s.sessionMu().Lock()
+	defer s.sessionMu().Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1206,7 +1213,7 @@ Rules:
 
 	fmt.Println()
 	var msgBuf strings.Builder
-	err = s.agent.RunOneShot(ctx, systemPrompt, userMsg, func(token string) {
+	err = s.activeLoop().RunOneShot(ctx, systemPrompt, userMsg, func(token string) {
 		fmt.Print(token)
 		msgBuf.WriteString(token)
 	})
@@ -1332,70 +1339,6 @@ func copyToClipboard(text string) error {
 	return fmt.Errorf("no clipboard utility found (install wl-clipboard, xclip, or xsel)")
 }
 
-// ── Context tools ─────────────────────────────────────────────────────────────
-
-// wireContextTools adds the read_context and describe_tool handlers and tool
-// defs to s.actTools/s.actHandlers. Called from New() and setModel().
-// Closures capture s so they always see the current ctxSlots and agent.
-func (s *Shell) wireContextTools() {
-	s.actTools = append(s.actTools, tools.ReadContextToolDef(), tools.DescribeToolToolDef())
-
-	s.actHandlers["read_context"] = func(args map[string]interface{}) (string, error) {
-		name, _ := args["name"].(string)
-		slot, ok := s.ctxSlots[name]
-		if !ok {
-			return "", fmt.Errorf("no context slot %q (try /ctx list)", name)
-		}
-		// Filtered read: return matching lines. No pagination needed — results are small.
-		if query, _ := args["query"].(string); query != "" {
-			return filterContent(slot.content, query), nil
-		}
-		// Unfiltered read: paginate to stay within ToolOutputMaxChars.
-		content := slot.content
-		limit := s.appCfg.ToolOutputMaxChars
-		if limit <= 0 {
-			limit = 4000
-		}
-		offset := 0
-		if v, ok := args["offset"].(float64); ok {
-			offset = int(v)
-		}
-		if offset < 0 || offset >= len(content) {
-			return fmt.Sprintf("[offset %d is out of range; slot is %d bytes]", offset, len(content)), nil
-		}
-		chunk := content[offset:]
-		if len(chunk) <= limit {
-			if offset > 0 {
-				return fmt.Sprintf("[bytes %d–%d of %d]\n\n%s", offset, offset+len(chunk), len(content), chunk), nil
-			}
-			return chunk, nil
-		}
-		// Find a clean line break near the limit to avoid cutting mid-line.
-		end := offset + limit
-		if nl := strings.LastIndexByte(content[offset:end], '\n'); nl > 0 {
-			end = offset + nl + 1
-		}
-		page := content[offset:end]
-		return fmt.Sprintf("%s\n\n[bytes %d–%d of %d — call read_context(%q, offset=%d) to continue]",
-			page, offset, end, len(content), name, end), nil
-	}
-
-	s.actHandlers["describe_tool"] = func(args map[string]interface{}) (string, error) {
-		name, _ := args["name"].(string)
-		for _, td := range s.agent.ToolDefs() {
-			if td.Name == name {
-				b, err := json.Marshal(td)
-				if err != nil {
-					return "", err
-				}
-				return string(b), nil
-			}
-		}
-		return "", fmt.Errorf("unknown tool %q", name)
-	}
-
-	s.agent.SetTools(s.actTools, s.actHandlers)
-}
 
 // slotDesc returns a stub description for a context slot, using the user-provided
 // description if set, otherwise generating one from the slot's content size.
@@ -1491,7 +1434,7 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func buildPrompt(jobs *jobManager, cfg config.PromptConfig) string {
+func buildPrompt(jobs *jobManager, cfg config.PromptConfig, session string) string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "?"
@@ -1509,6 +1452,11 @@ func buildPrompt(jobs *jobManager, cfg config.PromptConfig) string {
 			sb.WriteByte(' ')
 			sb.WriteString(colorize("("+branch+")", cfg.BranchColor))
 		}
+	}
+
+	if session != "" && session != "main" {
+		sb.WriteByte(' ')
+		sb.WriteString(colorize("["+session+"]", "cyan"))
 	}
 
 	if jobs != nil {
