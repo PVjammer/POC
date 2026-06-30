@@ -111,6 +111,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		sessions:      make(map[string]*sessionEntry),
 		activeSession: "main",
 	}
+	s.jobs.onComplete = s.maybeNotify
 
 	// Create the main session.
 	mainSess, err := s.createSession("main", "", nil, shellSlots, 0)
@@ -154,12 +155,10 @@ func (s *Shell) Run() error {
 			break
 		}
 
-		// Detect trailing & for background execution.
+		// Detect trailing & for background execution, with optional job name.
+		// Supported forms: "cmd &"  or  "cmd & jobname"
 		line = strings.TrimSpace(line)
-		background := strings.HasSuffix(line, "&")
-		if background {
-			line = strings.TrimSpace(strings.TrimSuffix(line, "&"))
-		}
+		background, jobName, line := parseBackgroundSuffix(line)
 
 		in := Parse(line)
 		if in.Content == "" && in.Type != InputPipeline {
@@ -176,19 +175,19 @@ func (s *Shell) Run() error {
 		switch in.Type {
 		case InputDirect:
 			if background {
-				s.runDirectBackground(in.Content)
+				s.runDirectBackground(in.Content, jobName)
 			} else {
 				s.runDirect(in.Content)
 			}
 		case InputAgent:
 			if background {
-				s.runAgentBackground(in.Content)
+				s.runAgentBackground(in.Content, jobName)
 			} else {
 				s.runAgent(in.Content)
 			}
 		case InputAgentAct:
 			if background {
-				s.runAgentActBackground(in.Content)
+				s.runAgentActBackground(in.Content, jobName)
 			} else {
 				s.runAgentAct(in.Content)
 			}
@@ -198,7 +197,7 @@ func (s *Shell) Run() error {
 			}
 		case InputPipeline:
 			if background {
-				s.runPipelineBackground(in.PipeLeft, in.PipeRight)
+				s.runPipelineBackground(in.PipeLeft, in.PipeRight, jobName)
 			} else {
 				s.runPipeline(in.PipeLeft, in.PipeRight)
 			}
@@ -356,9 +355,9 @@ func (s *Shell) runAgentCapture(ctx context.Context, msg string, act bool) (stri
 }
 
 // runDirectBackground runs a bash command in the background, capturing output.
-func (s *Shell) runDirectBackground(cmd string) {
+func (s *Shell) runDirectBackground(cmd, name string) {
 	display := truncateDisplay(cmd, 40)
-	id := s.jobs.start(display, func() (string, error) {
+	id, err := s.jobs.start(display, name, func() (string, error) {
 		c := exec.Command("sh", "-c", cmd)
 		var out bytes.Buffer
 		c.Stdout = &out
@@ -366,31 +365,39 @@ func (s *Shell) runDirectBackground(cmd string) {
 		err := c.Run()
 		return strings.TrimSpace(out.String()), err
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jobs: %v\n", err)
+		return
+	}
 	fmt.Printf("[%d] started: %s\n", id, display)
 }
 
 // runAgentBg is the shared background agent runner for both modes.
-func (s *Shell) runAgentBg(msg string, act bool) {
+func (s *Shell) runAgentBg(msg, name string, act bool) {
 	prefix := "?"
 	if act {
 		prefix = "!"
 	}
 	display := prefix + truncateDisplay(msg, 37)
 	s.syncAgentContext()
-	id := s.jobs.start(display, func() (string, error) {
+	id, err := s.jobs.start(display, name, func() (string, error) {
 		return s.runAgentCapture(context.Background(), msg, act)
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jobs: %v\n", err)
+		return
+	}
 	fmt.Printf("[%d] started: %s\n", id, display)
 }
 
-func (s *Shell) runAgentBackground(msg string)    { s.runAgentBg(msg, false) }
-func (s *Shell) runAgentActBackground(msg string) { s.runAgentBg(msg, true) }
+func (s *Shell) runAgentBackground(msg, name string)    { s.runAgentBg(msg, name, false) }
+func (s *Shell) runAgentActBackground(msg, name string) { s.runAgentBg(msg, name, true) }
 
 // runPipelineBackground runs a pipeline (bash | /fn or bash | ?msg) as a background job.
-func (s *Shell) runPipelineBackground(leftCmd string, right *ParsedInput) {
+func (s *Shell) runPipelineBackground(leftCmd string, right *ParsedInput, name string) {
 	display := truncateDisplay(leftCmd+" | "+rightDisplay(right), 40)
 	s.syncAgentContext()
-	id := s.jobs.start(display, func() (string, error) {
+	id, err := s.jobs.start(display, name, func() (string, error) {
 		content, err := s.resolveLeftContent(leftCmd)
 		if err != nil {
 			return "", err
@@ -400,6 +407,10 @@ func (s *Shell) runPipelineBackground(leftCmd string, right *ParsedInput) {
 		}
 		return s.applyRightCapture(context.Background(), content, right)
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jobs: %v\n", err)
+		return
+	}
 	fmt.Printf("[%d] started: %s\n", id, display)
 }
 
@@ -433,21 +444,17 @@ func (s *Shell) runMetaCapture(cmd string) (string, error) {
 	switch parts[0] {
 	case "job", "jobs":
 		if len(parts) < 2 {
-			return "", fmt.Errorf("/job: usage: /job <N>")
+			return "", fmt.Errorf("/job: usage: /job <N|name>")
 		}
-		id, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return "", fmt.Errorf("/job: invalid id %q", parts[1])
-		}
-		j := s.jobs.get(id)
+		j := s.jobs.resolve(parts[1])
 		if j == nil {
-			return "", fmt.Errorf("/job: no job %d", id)
+			return "", fmt.Errorf("/job: no job %q", parts[1])
 		}
 		switch j.status {
 		case jobRunning:
-			return "", fmt.Errorf("/job %d: still running — wait for it to finish first", id)
+			return "", fmt.Errorf("/job %q: still running — wait for it to finish first", parts[1])
 		case jobFailed:
-			return "", fmt.Errorf("/job %d: failed: %v", id, j.err)
+			return "", fmt.Errorf("/job %q: failed: %v", parts[1], j.err)
 		case jobDone:
 			return j.output, nil
 		}
@@ -511,6 +518,14 @@ func (s *Shell) applyRightCapture(ctx context.Context, content string, right *Pa
 			msg = msg + "\n\n" + q
 		}
 		return s.runAgentCapture(ctx, msg, true)
+	case InputBash:
+		cmd := exec.CommandContext(ctx, "sh", "-c", right.Content)
+		cmd.Stdin = strings.NewReader(content)
+		var outBuf bytes.Buffer
+		cmd.Stdout = &outBuf
+		cmd.Stderr = os.Stderr
+		cmd.Run() //nolint:errcheck — non-zero exits (e.g. grep no match) are normal
+		return outBuf.String(), nil
 	}
 	return "", nil
 }
@@ -726,6 +741,7 @@ func (s *Shell) runConfig(args []string) {
 		fmt.Printf("  %-30s %v\n", "max_context_tokens", s.appCfg.MaxContextTokens)
 		fmt.Printf("  %-30s %v\n", "compaction_threshold", s.appCfg.CompactionThreshold)
 		fmt.Printf("  %-30s %v\n", "compaction_tail_messages", s.appCfg.CompactionTailMessages)
+		fmt.Printf("  %-30s %v\n", "notifications", s.appCfg.Notifications)
 		fmt.Println()
 		fmt.Printf("  %-30s %v\n", "prompt.path_max_depth", p.PathMaxDepth)
 		fmt.Printf("  %-30s %v\n", "prompt.show_git_branch", p.ShowGitBranch)
@@ -804,6 +820,16 @@ func (s *Shell) runConfig(args []string) {
 				return
 			}
 			s.appCfg.CompactionTailMessages = n
+		case "notifications":
+			switch val {
+			case "true", "1", "yes":
+				s.appCfg.Notifications = true
+			case "false", "0", "no":
+				s.appCfg.Notifications = false
+			default:
+				fmt.Fprintln(os.Stderr, "config: notifications must be true or false")
+				return
+			}
 		case "prompt.path_max_depth":
 			n, err := strconv.Atoi(val)
 			if err != nil || n < 0 {
@@ -872,6 +898,7 @@ func (s *Shell) printHelp() {
 	fmt.Println("AI (advisory — explains and guides, never executes):")
 	fmt.Println("  ?<text>            ask a question or request guidance")
 	fmt.Println("  ?<text> &          run in background")
+	fmt.Println("  ?<text> & name     run in background, tag with name")
 	fmt.Println()
 	fmt.Println("AI (agentic — executes commands; permissions tier applies):")
 	fmt.Println("  !\"<text>\"          ask the AI to act")
@@ -895,10 +922,11 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /ctx clear [name]  remove one slot or all")
 	fmt.Println("  /config            show or change settings")
 	fmt.Println("  /jobs              list background jobs")
-	fmt.Println("  /job <N>           show output of job N")
-	fmt.Println("  /job <N> | /fn     pipe job output into a function")
-	fmt.Println("  /job <N> | ?msg    pipe job output to advisory AI")
-	fmt.Println("  /job <N> | /ctx add <name>  store job output in context")
+	fmt.Println("  /job <N|name>      show output of job N or named job")
+	fmt.Println("  /job <N|name> | /fn       pipe job output into a function")
+	fmt.Println("  /job <N|name> | ?msg      pipe job output to advisory AI")
+	fmt.Println("  /job <N|name> | grep foo  pipe job output through bash")
+	fmt.Println("  /job <N|name> | /ctx add <name>  store job output in context")
 	fmt.Println("  /commit-msg        generate a commit message from staged git changes")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
@@ -1012,33 +1040,36 @@ func (s *Shell) applyRight(ctx context.Context, content string, right *ParsedInp
 		}
 		s.syncAgentContext()
 		s.runAgentAct(msg)
+	case InputBash:
+		cmd := exec.CommandContext(ctx, "sh", "-c", right.Content)
+		cmd.Stdin = strings.NewReader(content)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Run() //nolint:errcheck — non-zero exits (e.g. grep no match) are normal
 	}
 }
 
-// runJobs handles /jobs (list all) and /job N (show output of job N).
+// runJobs handles /jobs (list all) and /job N|name (show output of a job).
 func (s *Shell) runJobs(args []string) {
 	if len(args) >= 1 {
-		id, err := strconv.Atoi(args[0])
-		if err == nil {
-			j := s.jobs.get(id)
-			if j == nil {
-				fmt.Fprintf(os.Stderr, "jobs: no job %d\n", id)
-				return
-			}
-			switch j.status {
-			case jobRunning:
-				fmt.Printf("[%d] still running (%.1fs)\n", j.id, time.Since(j.startedAt).Seconds())
-			case jobFailed:
-				fmt.Printf("[%d] failed: %v\n", j.id, j.err)
-			case jobDone:
-				if j.output != "" {
-					fmt.Println(j.output)
-				} else {
-					fmt.Printf("[%d] done (no output)\n", j.id)
-				}
-			}
+		j := s.jobs.resolve(args[0])
+		if j == nil {
+			fmt.Fprintf(os.Stderr, "jobs: no job %q\n", args[0])
 			return
 		}
+		switch j.status {
+		case jobRunning:
+			fmt.Printf("[%d] still running (%.1fs)\n", j.id, time.Since(j.startedAt).Seconds())
+		case jobFailed:
+			fmt.Printf("[%d] failed: %v\n", j.id, j.err)
+		case jobDone:
+			if j.output != "" {
+				fmt.Println(j.output)
+			} else {
+				fmt.Printf("[%d] done (no output)\n", j.id)
+			}
+		}
+		return
 	}
 
 	jobs := s.jobs.list()
@@ -1048,16 +1079,20 @@ func (s *Shell) runJobs(args []string) {
 	}
 	fmt.Println()
 	for _, j := range jobs {
+		nameTag := ""
+		if j.name != "" {
+			nameTag = " \033[36m[" + j.name + "]\033[0m"
+		}
 		switch j.status {
 		case jobRunning:
-			fmt.Printf("  %2d  \033[33mrunning\033[0m  %5.1fs  %s\n",
-				j.id, time.Since(j.startedAt).Seconds(), j.display)
+			fmt.Printf("  %2d%s  \033[33mrunning\033[0m  %5.1fs  %s\n",
+				j.id, nameTag, time.Since(j.startedAt).Seconds(), j.display)
 		case jobDone:
-			fmt.Printf("  %2d  \033[32mdone\033[0m     %5.1fs  %s%s\n",
-				j.id, j.elapsed.Seconds(), j.display, sizeLabel(len(j.output)))
+			fmt.Printf("  %2d%s  \033[32mdone\033[0m     %5.1fs  %s%s\n",
+				j.id, nameTag, j.elapsed.Seconds(), j.display, sizeLabel(len(j.output)))
 		case jobFailed:
-			fmt.Printf("  %2d  \033[31mfailed\033[0m   %5.1fs  %s  (%v)\n",
-				j.id, j.elapsed.Seconds(), j.display, j.err)
+			fmt.Printf("  %2d%s  \033[31mfailed\033[0m   %5.1fs  %s  (%v)\n",
+				j.id, nameTag, j.elapsed.Seconds(), j.display, j.err)
 		}
 	}
 	fmt.Println()
@@ -1545,6 +1580,50 @@ func truncateDisplay(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
+// parseBackgroundSuffix detects a trailing & and optional job name.
+// It handles:
+//
+//	"cmd &"           → bg=true, name="", stripped="cmd"
+//	"cmd & auth"      → bg=true, name="auth", stripped="cmd"
+//	"cmd"             → bg=false, name="", stripped="cmd"
+func parseBackgroundSuffix(line string) (bg bool, name, stripped string) {
+	// Look for the last occurrence of " &" in the line.
+	if idx := strings.LastIndex(line, " &"); idx >= 0 {
+		rest := strings.TrimSpace(line[idx+2:])
+		base := strings.TrimSpace(line[:idx])
+		if rest == "" {
+			return true, "", base
+		}
+		if isValidJobName(rest) {
+			return true, rest, base
+		}
+	}
+	// No " &" found; check for a bare trailing "&" (no space before it).
+	if strings.HasSuffix(line, "&") {
+		return true, "", strings.TrimSpace(strings.TrimSuffix(line, "&"))
+	}
+	return false, "", line
+}
+
+// maybeNotify fires a desktop notification for a completed job if notifications
+// are enabled in config. Called from the job goroutine via jobs.onComplete.
+func (s *Shell) maybeNotify(j *job) {
+	if !s.appCfg.Notifications {
+		return
+	}
+	nameTag := ""
+	if j.name != "" {
+		nameTag = " [" + j.name + "]"
+	}
+	var body string
+	if j.status == jobDone {
+		body = fmt.Sprintf("[%d]%s done: %s", j.id, nameTag, j.display)
+	} else {
+		body = fmt.Sprintf("[%d]%s failed: %s — %v", j.id, nameTag, j.display, j.err)
+	}
+	sendDesktopNotification("baish", body)
+}
+
 // rightDisplay returns a short display string for the right side of a pipeline.
 func rightDisplay(right *ParsedInput) string {
 	if right == nil {
@@ -1557,6 +1636,8 @@ func rightDisplay(right *ParsedInput) string {
 		return "/" + right.Content
 	case InputPipeline:
 		return "/" + right.PipeLeft + " | " + rightDisplay(right.PipeRight)
+	case InputBash:
+		return right.Content
 	}
 	return right.Content
 }

@@ -17,6 +17,9 @@ const (
 	// InputPipeline: <bash_cmd> | /fn  or  <bash_cmd> | ?msg
 	// The left side is run as bash; its stdout becomes stdin for the right side.
 	InputPipeline
+	// InputBash: a plain bash command appearing on the right side of a pipeline
+	// from an AI command. e.g. /job 1 | grep foo — "grep foo" is InputBash.
+	InputBash
 )
 
 // ParsedInput is the result of classifying a line of user input.
@@ -46,6 +49,19 @@ func Parse(raw string) ParsedInput {
 			Type:      InputPipeline,
 			PipeLeft:  left,
 			PipeRight: &right,
+		}
+	}
+
+	// Detect "/ai-cmd | bash_cmd" — AI command on the left piping into plain bash.
+	// e.g. "/job 1 | grep foo", "/ctx show arch | wc -l"
+	if idx := pipeFromAI(raw); idx >= 0 {
+		left := strings.TrimSpace(raw[:idx])
+		right := strings.TrimSpace(raw[idx+1:])
+		bashRight := ParsedInput{Type: InputBash, Content: right}
+		return ParsedInput{
+			Type:      InputPipeline,
+			PipeLeft:  left,
+			PipeRight: &bashRight,
 		}
 	}
 
@@ -84,6 +100,22 @@ func pipeToAI(s string) int {
 		if s[i] == '|' {
 			right := strings.TrimSpace(s[i+1:])
 			if isAISegment(right) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// pipeFromAI scans left-to-right for the first `|` whose LEFT-hand side is an
+// AI segment and right-hand side is plain bash. This handles "/job 1 | grep foo"
+// and "/ctx show arch | wc -l". Called only after pipeToAI returns -1.
+func pipeFromAI(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '|' {
+			left := strings.TrimSpace(s[:i])
+			right := strings.TrimSpace(s[i+1:])
+			if isAISegment(left) && !isAISegment(right) && right != "" {
 				return i
 			}
 		}

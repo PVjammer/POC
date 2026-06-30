@@ -42,6 +42,8 @@ type Config struct {
 	MaxContextTokens       int     `toml:"max_context_tokens"`       // model context ceiling in tokens
 	CompactionThreshold    float64 `toml:"compaction_threshold"`     // fire LLM compaction at this fraction of ceiling
 	CompactionTailMessages int     `toml:"compaction_tail_messages"` // messages always kept verbatim in tail
+
+	Notifications bool `toml:"notifications"` // send desktop notification when a background job completes
 }
 
 // Defaults returns the baseline configuration.
