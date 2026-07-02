@@ -19,21 +19,76 @@ const (
 	OverflowSummarize ToolOverflow = "summarize"
 )
 
+// PromptConfig controls the appearance of the shell prompt.
+type PromptConfig struct {
+	PathMaxDepth  int    `toml:"path_max_depth"`   // segments to show; 0 = full path
+	ShowGitBranch bool   `toml:"show_git_branch"`  // show (branch) after path
+	PathColor     string `toml:"path_color"`        // red green yellow blue magenta cyan white bold dim none
+	BranchColor   string `toml:"branch_color"`
+	JobColor      string `toml:"job_color"`         // color for [N✓] indicator
+	Suffix        string `toml:"suffix"`            // text after all segments, e.g. " $ "
+}
+
 // Config holds tuneable shell settings.
 type Config struct {
 	MaxHistoryMessages int          `toml:"max_history_messages"`
 	ToolOutputMaxChars int          `toml:"tool_output_max_chars"`
 	ToolOverflow       ToolOverflow `toml:"tool_output_overflow"`
-	CtxMaxInjectChars  int          `toml:"ctx_max_inject_chars"`
+	CtxInlineThreshold int          `toml:"ctx_inline_threshold"` // bytes; slots larger than this become stubs
+	Prompt             PromptConfig `toml:"prompt"`
+
+	// Context / compaction settings.
+	ToolOutputKeepRounds   int     `toml:"tool_output_keep_rounds"`  // rounds of tool outputs to keep verbatim
+	MaxContextTokens       int     `toml:"max_context_tokens"`       // model context ceiling in tokens
+	CompactionThreshold    float64 `toml:"compaction_threshold"`     // fire LLM compaction at this fraction of ceiling
+	CompactionTailMessages int     `toml:"compaction_tail_messages"` // messages always kept verbatim in tail
+	MaxResponseTokens      int     `toml:"max_response_tokens"`      // max tokens the model may generate per turn
+
+	Notifications bool `toml:"notifications"` // send desktop notification when a background job completes
 }
 
 // Defaults returns the baseline configuration.
 func Defaults() Config {
 	return Config{
-		MaxHistoryMessages: 20,
-		ToolOutputMaxChars: 4000,
-		ToolOverflow:       OverflowTruncate,
-		CtxMaxInjectChars:  8000,
+		MaxHistoryMessages:     20,
+		ToolOutputMaxChars:     4000,
+		ToolOverflow:           OverflowTruncate,
+		CtxInlineThreshold:     4096,
+		ToolOutputKeepRounds:   3,
+		MaxContextTokens:       8192,
+		CompactionThreshold:    0.75,
+		CompactionTailMessages: 20,
+		MaxResponseTokens:      16384,
+		Prompt: PromptConfig{
+			PathMaxDepth:  3,
+			ShowGitBranch: true,
+			PathColor:     "green",
+			BranchColor:   "magenta",
+			JobColor:      "yellow",
+			Suffix:        " $ ",
+		},
+	}
+}
+
+// applyPromptDefaults fills zero-valued prompt fields with sensible defaults.
+// Handles existing config files that predate the [prompt] section.
+func applyPromptDefaults(p *PromptConfig) {
+	// If all string fields are empty the section was absent — apply everything.
+	sectionAbsent := p.PathColor == "" && p.BranchColor == "" && p.JobColor == "" && p.Suffix == ""
+	if sectionAbsent {
+		p.ShowGitBranch = true
+	}
+	if p.PathColor == "" {
+		p.PathColor = "green"
+	}
+	if p.BranchColor == "" {
+		p.BranchColor = "magenta"
+	}
+	if p.JobColor == "" {
+		p.JobColor = "yellow"
+	}
+	if p.Suffix == "" {
+		p.Suffix = " $ "
 	}
 }
 
@@ -75,10 +130,26 @@ func Load() (Config, error) {
 	if cfg.ToolOverflow != OverflowSummarize {
 		cfg.ToolOverflow = OverflowTruncate
 	}
-	if cfg.CtxMaxInjectChars < 500 {
-		cfg.CtxMaxInjectChars = 500
+	if cfg.CtxInlineThreshold < 256 {
+		cfg.CtxInlineThreshold = 256
+	}
+	if cfg.ToolOutputKeepRounds < 1 {
+		cfg.ToolOutputKeepRounds = 1
+	}
+	if cfg.MaxContextTokens < 1024 {
+		cfg.MaxContextTokens = 4096
+	}
+	if cfg.CompactionThreshold <= 0 || cfg.CompactionThreshold >= 1 {
+		cfg.CompactionThreshold = 0.75
+	}
+	if cfg.CompactionTailMessages < 4 {
+		cfg.CompactionTailMessages = 4
+	}
+	if cfg.MaxResponseTokens < 256 {
+		cfg.MaxResponseTokens = 16384
 	}
 
+	applyPromptDefaults(&cfg.Prompt)
 	return cfg, nil
 }
 

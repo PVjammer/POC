@@ -70,7 +70,8 @@ func (c *HybridCompleter) Do(line []rune, pos int) ([][]rune, int) {
 var bashCompletionScript = `
 for f in /usr/share/bash-completion/bash_completion \
          /etc/bash_completion \
-         /usr/local/share/bash-completion/bash_completion; do
+         /usr/local/share/bash-completion/bash_completion \
+         /opt/homebrew/share/bash-completion/bash_completion; do
     [[ -f "$f" ]] && source "$f" 2>/dev/null && break
 done
 

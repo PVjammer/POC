@@ -8,13 +8,18 @@ type InputType int
 const (
 	// InputDirect: plain text or !cmd — pass to bash
 	InputDirect InputType = iota
-	// InputAgent: ?msg — send to AI agent
+	// InputAgent: ?msg — advisory AI (no tool execution)
 	InputAgent
+	// InputAgentAct: !"msg" — agentic AI (may execute commands; permissions apply)
+	InputAgentAct
 	// InputMeta: /cmd or /fn — built-in command or AI function
 	InputMeta
 	// InputPipeline: <bash_cmd> | /fn  or  <bash_cmd> | ?msg
 	// The left side is run as bash; its stdout becomes stdin for the right side.
 	InputPipeline
+	// InputBash: a plain bash command appearing on the right side of a pipeline
+	// from an AI command. e.g. /job 1 | grep foo — "grep foo" is InputBash.
+	InputBash
 )
 
 // ParsedInput is the result of classifying a line of user input.
@@ -47,12 +52,34 @@ func Parse(raw string) ParsedInput {
 		}
 	}
 
+	// Detect "/ai-cmd | bash_cmd" — AI command on the left piping into plain bash.
+	// e.g. "/job 1 | grep foo", "/ctx show arch | wc -l"
+	if idx := pipeFromAI(raw); idx >= 0 {
+		left := strings.TrimSpace(raw[:idx])
+		right := strings.TrimSpace(raw[idx+1:])
+		bashRight := ParsedInput{Type: InputBash, Content: right}
+		return ParsedInput{
+			Type:      InputPipeline,
+			PipeLeft:  left,
+			PipeRight: &bashRight,
+		}
+	}
+
 	switch {
 	case strings.HasPrefix(raw, "!"):
-		// Explicit bash override (redundant now, kept for muscle memory).
-		return ParsedInput{Type: InputDirect, Content: strings.TrimSpace(raw[1:])}
+		rest := raw[1:]
+		// !"..." or !'...' → agentic mode; bare !cmd → direct bash (history expansion etc.)
+		if len(rest) > 0 && (rest[0] == '"' || rest[0] == '\'') {
+			return ParsedInput{Type: InputAgentAct, Content: strings.TrimSpace(stripOuterQuotes(rest))}
+		}
+		return ParsedInput{Type: InputDirect, Content: strings.TrimSpace(rest)}
 	case strings.HasPrefix(raw, "?"):
-		return ParsedInput{Type: InputAgent, Content: strings.TrimSpace(raw[1:])}
+		rest := raw[1:]
+		// Optional quotes — ?"..." and ?... are both advisory
+		if len(rest) > 0 && (rest[0] == '"' || rest[0] == '\'') {
+			return ParsedInput{Type: InputAgent, Content: strings.TrimSpace(stripOuterQuotes(rest))}
+		}
+		return ParsedInput{Type: InputAgent, Content: strings.TrimSpace(rest)}
 	case strings.HasPrefix(raw, "/"):
 		return ParsedInput{Type: InputMeta, Content: strings.TrimSpace(raw[1:])}
 	default:
@@ -80,9 +107,29 @@ func pipeToAI(s string) int {
 	return -1
 }
 
+// pipeFromAI scans left-to-right for the first `|` whose LEFT-hand side is an
+// AI segment and right-hand side is plain bash. This handles "/job 1 | grep foo"
+// and "/ctx show arch | wc -l". Called only after pipeToAI returns -1.
+func pipeFromAI(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '|' {
+			left := strings.TrimSpace(s[:i])
+			right := strings.TrimSpace(s[i+1:])
+			if isAISegment(left) && !isAISegment(right) && right != "" {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // isAISegment reports whether a trimmed string looks like an AI routing prefix.
 func isAISegment(s string) bool {
 	if strings.HasPrefix(s, "?") {
+		return true
+	}
+	// !"..." is an agentic segment
+	if len(s) > 1 && s[0] == '!' && (s[1] == '"' || s[1] == '\'') {
 		return true
 	}
 	if !strings.HasPrefix(s, "/") {
@@ -92,4 +139,21 @@ func isAISegment(s string) bool {
 	// This ensures "/summarize" matches but "/usr/bin/grep foo" does not.
 	first := strings.Fields(s[1:])
 	return len(first) > 0 && !strings.Contains(first[0], "/")
+}
+
+// stripOuterQuotes removes a matching pair of surrounding " or ' characters.
+// If the string has an opening quote but no matching closing quote, only the
+// opening quote is removed. Non-quoted strings are returned unchanged.
+func stripOuterQuotes(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	q := s[0]
+	if q != '"' && q != '\'' {
+		return s
+	}
+	if len(s) >= 2 && s[len(s)-1] == q {
+		return s[1 : len(s)-1]
+	}
+	return s[1:] // unclosed quote — strip opening only
 }
