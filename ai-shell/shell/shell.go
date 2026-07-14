@@ -559,7 +559,7 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			s.runCtx(nil, "")
 			return false
 		case "config":
-			s.runConfig(nil)
+			s.runConfig([]string{"--help"})
 			return false
 		case "jobs", "job":
 			s.runJobs([]string{"--help"})
@@ -572,6 +572,11 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			return false
 		case "model":
 			fmt.Printf("usage: /model <name> [endpoint]\nmodel: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+			return false
+		case "commit-msg", "commit", "cm":
+			fmt.Println("usage: /commit-msg")
+			fmt.Println("  Generates a commit message from staged git changes.")
+			fmt.Println("  Stage changes with 'git add' before running.")
 			return false
 		}
 	}
@@ -789,6 +794,12 @@ func (s *Shell) runConfig(args []string) {
 	}
 
 	switch args[0] {
+	case "--help", "-h", "help":
+		fmt.Println("usage:")
+		fmt.Println("  /config                    show current settings")
+		fmt.Println("  /config set <key> <value>  change a setting")
+		fmt.Println("  /config reset              restore defaults")
+		return
 	case "set":
 		if len(args) < 3 {
 			fmt.Fprintln(os.Stderr, "usage: /config set <key> <value>")
@@ -965,7 +976,7 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /job <N|name> | ?msg      pipe job output to advisory AI")
 	fmt.Println("  /job <N|name> | grep foo  pipe job output through bash")
 	fmt.Println("  /job <N|name> | /ctx add <name>  store job output in context")
-	fmt.Println("  /commit-msg        generate a commit message from staged git changes")
+	fmt.Println("  /commit-msg (/cm)  generate a commit message from staged git changes")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model and endpoint")
@@ -1824,5 +1835,5 @@ func wordWrap(text string, width int) []string {
 }
 
 func metaCommands() []string {
-	return []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "exit"}
+	return []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "cm", "exit"}
 }
