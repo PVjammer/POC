@@ -7,6 +7,16 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/pvjammer/ai-shell-poc/config"
+)
+
+// withAction determines what happens when a /with context is triggered.
+type withAction int
+
+const (
+	withActionAnalyze withAction = iota // dispatch to the AI agent
+	withActionStore                     // write buffer into a ctx slot directly
 )
 
 // withModeConfig defines the behavior for a named /with capture mode.
@@ -14,7 +24,8 @@ import (
 // permission decision — the registry is intentionally explicit and finite.
 type withModeConfig struct {
 	description string
-	agentic     bool // true = full tool set (agentic); false = advisory tools only
+	agentic     bool       // true = full tool set; false = advisory tools only
+	action      withAction // default: withActionAnalyze
 }
 
 // withModes is the curated registry of capture modes. Each name here becomes
@@ -24,6 +35,19 @@ var withModes = map[string]withModeConfig{
 	"debug": {
 		description: "analyze errors and trace root causes across output and source files",
 		agentic:     true,
+	},
+	"recap": {
+		description: "summarize session activity for standups, handoffs, or picking up tomorrow",
+		agentic:     false,
+	},
+	"scripts": {
+		description: "identify repetitive patterns and propose automation scripts",
+		agentic:     true,
+	},
+	"context": {
+		description: "accumulate output and store it in a named context slot (no AI)",
+		agentic:     false,
+		action:      withActionStore,
 	},
 }
 
@@ -36,8 +60,7 @@ type withContext struct {
 	started  time.Time
 }
 
-// runWith handles /with <mode> [--on-error] and management subcommands
-// (status, clear, end).
+// runWith handles /with <mode> [--on-error] and management subcommands.
 func (s *Shell) runWith(args []string) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		s.printWithHelp()
@@ -98,20 +121,25 @@ func (s *Shell) runWith(args []string) {
 		if onError {
 			suffix = " --on-error"
 		}
-		fmt.Printf("\033[2m[with:%s started%s — type /%s to trigger]\033[0m\n", name, suffix, name)
+		closing := fmt.Sprintf("/%s", name)
+		if withModes[name].action == withActionStore {
+			closing = fmt.Sprintf("/%s [slot-name]", name)
+		}
+		fmt.Printf("\033[2m[with:%s started%s — type %s to close]\033[0m\n", name, suffix, closing)
 	}
 }
 
-// triggerWith fires the agent using the capture buffer for the active mode.
-// It clears s.withCtx before dispatching so nested capture cannot occur.
-func (s *Shell) triggerWith() {
+// triggerWith fires the configured action for the active capture context.
+// args are passed from the closing command (e.g. slot name for /context notes).
+// Clears s.withCtx before acting so nested capture cannot occur.
+func (s *Shell) triggerWith(args []string) {
 	if s.withCtx == nil {
 		return
 	}
 	ctx := s.withCtx
 	s.withCtx = nil
 
-	modeCfg := withModes[ctx.name] // name was validated at /with time
+	modeCfg := withModes[ctx.name]
 	content := ctx.buf.String()
 
 	if strings.TrimSpace(content) == "" {
@@ -122,6 +150,23 @@ func (s *Shell) triggerWith() {
 	fmt.Printf("\n\033[2m[with:%s — %d cmd(s), %s, %.1fs]\033[0m\n\n",
 		ctx.name, ctx.cmdCount, humanSize(len(content)), time.Since(ctx.started).Seconds())
 
+	// Store action: write buffer directly into a ctx slot, no AI involved.
+	if modeCfg.action == withActionStore {
+		slotName := "capture"
+		if len(args) > 0 && args[0] != "" {
+			slotName = args[0]
+		}
+		s.currentSession().ctxSlots[slotName] = shellCtxSlot{content: content}
+		if slotName != "default" {
+			if err := config.SaveContext(slotName, content); err != nil {
+				fmt.Fprintf(os.Stderr, "with: warning: could not persist slot: %v\n", err)
+			}
+		}
+		s.printCtxFeedback("set", slotName, len(content))
+		return
+	}
+
+	// Analyze action: build a mode-specific prompt and dispatch to the agent.
 	const inlineThreshold = 8000
 
 	var prompt string
@@ -149,11 +194,43 @@ func (s *Shell) triggerWith() {
 func withPromptInline(mode, content string) string {
 	switch mode {
 	case "debug":
-		return "Debug capture session:\n\n" + content + `
+		return `Debug capture session:
 
-Analyze the output above for errors, exceptions, or failures.
-If file paths or line numbers appear (tracebacks, compiler errors, Go panics), read those files at the relevant lines.
-Explain the root cause and suggest a concrete fix.`
+` + content + `
+
+First, identify the failure type from the output:
+- Runtime error / traceback: read the source files at the mentioned file paths and line numbers
+- Test failure (pytest / go test / jest / etc.): read BOTH the failing test AND the implementation it exercises — the fix may be in either
+- Build or compiler error: read the source file at the reported line, check imports and types
+- Docker layer failure: read the Dockerfile and identify the failing layer
+
+Then:
+1. Explain the root cause clearly
+2. Show the corrected code`
+
+	case "recap":
+		return `Work session activity:
+
+` + content + `
+
+Summarize what happened. Focus on:
+- What was being worked on (infer from commands, file paths, error messages)
+- Key outcomes: what succeeded, what failed, what was left unresolved
+- Any decisions or discoveries worth noting
+
+Write 3–5 bullet points suitable for a standup update or end-of-day note.`
+
+	case "scripts":
+		return `Work session capture:
+
+` + content + `
+
+Analyze the commands above for patterns worth automating. For each opportunity:
+1. Describe the pattern (what is repeated or error-prone)
+2. Propose a shell script, function, or alias that automates it
+3. Show the complete implementation
+
+Focus on: sequences run more than once, long commands that could be wrapped, multi-step workflows that are easy to get wrong. If asked, write the scripts to an appropriate location (~/bin/, a local scripts/ directory, or as shell functions in ~/.bashrc).`
 	}
 	return content
 }
@@ -163,13 +240,44 @@ func withPromptFile(mode, path string) string {
 	case "debug":
 		return fmt.Sprintf(`Debug capture was written to: %s
 
-The file may be large. Follow these steps:
-1. Search for error patterns:
-   grep -in "error\|exception\|panic\|traceback\|failed\|fatal" %s | head -60
-2. Check recent output:
+The file may be large. Work through it in order:
+1. Grep for error patterns to orient yourself:
+   grep -in "error\|exception\|panic\|traceback\|failed\|fatal\|assert" %s | head -60
+2. Check the tail for the most recent output:
    tail -50 %s
-3. Extract any file paths and line numbers from the output, then read those files at the relevant lines.
-4. Identify the root cause and suggest a fix.`, path, path, path)
+3. Identify the failure type:
+   - Runtime error / traceback: read source files at the mentioned paths and line numbers
+   - Test failure (pytest / go test / jest / etc.): read BOTH the failing test AND the implementation — the fix may be in either
+   - Build or compiler error: read the source file at the reported line, check imports and types
+   - Docker layer failure: read the Dockerfile and identify the failing layer
+4. Explain the root cause and show the corrected code.`, path, path, path)
+
+	case "recap":
+		return fmt.Sprintf(`Work session activity was written to: %s
+
+To orient yourself:
+1. Extract the commands run:
+   grep "^\$ " %s
+2. Check for errors and failures:
+   grep -in "error\|failed\|\[exit: [^0]\]" %s | head -30
+
+Then summarize in 3–5 bullet points:
+- What was worked on
+- Key outcomes (successes, failures, unresolved issues)
+- Anything worth noting for tomorrow`, path, path, path)
+
+	case "scripts":
+		return fmt.Sprintf(`Work session capture is in: %s
+
+First, extract the commands that were run:
+  grep "^\$ " %s
+
+Look for repetition and multi-step sequences. For each automation opportunity:
+1. Describe the pattern (what is repeated or error-prone)
+2. Propose a shell script, function, or alias
+3. Show the complete implementation
+
+If asked, write the scripts to an appropriate location.`, path, path)
 	}
 	return fmt.Sprintf("Captured output is in %s — search or read it to complete the task.", path)
 }
@@ -187,16 +295,20 @@ func (s *Shell) printWithHelp() {
 	fmt.Println("usage: /with <mode> [--on-error]")
 	fmt.Println("       /with status | clear | end")
 	fmt.Println()
-	fmt.Println("  Capture command output for AI analysis.")
-	fmt.Println("  Type /<mode> to close the context and trigger the agent.")
+	fmt.Println("  Capture command output for later AI analysis or storage.")
+	fmt.Println("  Type /<mode> to close the context and trigger the action.")
 	fmt.Println()
 	fmt.Println("  Modes:")
 	for _, name := range s.withModeNames() {
 		cfg := withModes[name]
-		fmt.Printf("    %-12s  %s\n", name, cfg.description)
+		closing := "/" + name
+		if cfg.action == withActionStore {
+			closing = "/" + name + " [slot]"
+		}
+		fmt.Printf("    %-12s  %-20s  %s\n", name, closing, cfg.description)
 	}
 	fmt.Println()
-	fmt.Println("  --on-error   auto-trigger when a command exits non-zero")
+	fmt.Println("  --on-error   auto-trigger when a command exits non-zero (analyze modes only)")
 	fmt.Println()
 	fmt.Println("  Management:")
 	fmt.Println("    /with status   show buffer size and elapsed time")
@@ -206,4 +318,6 @@ func (s *Shell) printWithHelp() {
 	fmt.Println("  Examples:")
 	fmt.Println("    /with debug             capture commands; /debug to trigger")
 	fmt.Println("    /with debug --on-error  auto-trigger on first non-zero exit")
+	fmt.Println("    /with recap             capture session; /recap for standup summary")
+	fmt.Println("    /with context           capture output; /context notes to store as ctx slot")
 }

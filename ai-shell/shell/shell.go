@@ -249,7 +249,7 @@ func (s *Shell) runDirect(cmdStr string) {
 			fmt.Fprintf(&s.withCtx.buf, "[exit: %d]\n\n", s.lastExitCode)
 			s.withCtx.cmdCount++
 			if s.withCtx.onError && s.lastExitCode != 0 {
-				s.triggerWith()
+				s.triggerWith(nil)
 			}
 		}()
 	}
@@ -614,6 +614,11 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 		case "with":
 			s.printWithHelp()
 			return false
+		default:
+			if _, ok := withModes[name]; ok {
+				s.printWithHelp()
+				return false
+			}
 		}
 	}
 
@@ -674,8 +679,12 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 	default:
 		// Check if this is a /with trigger command (e.g. /debug closes /with debug).
 		if _, ok := withModes[name]; ok {
+			if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+				s.printWithHelp()
+				return false
+			}
 			if s.withCtx != nil && s.withCtx.name == name {
-				s.triggerWith()
+				s.triggerWith(args)
 			} else if s.withCtx != nil {
 				fmt.Fprintf(os.Stderr, "with: active context is /%s, not /%s — run /%s to trigger\n",
 					s.withCtx.name, name, s.withCtx.name)
@@ -1028,8 +1037,11 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /job <N|name> | grep foo  pipe job output through bash")
 	fmt.Println("  /job <N|name> | /ctx add <name>  store job output in context")
 	fmt.Println("  /commit-msg (/cm)  generate a commit message from staged git changes")
-	fmt.Println("  /with <mode>       start output capture for AI analysis (see /with --help)")
-	fmt.Println("  /debug             trigger /with debug analysis")
+	fmt.Println("  /with <mode>       start output capture (see /with --help for all modes)")
+	fmt.Println("  /debug             trigger /with debug  — error analysis")
+	fmt.Println("  /recap             trigger /with recap  — session summary")
+	fmt.Println("  /scripts           trigger /with scripts — automation proposals")
+	fmt.Println("  /context [slot]    trigger /with context — store buffer as ctx slot")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model and endpoint")
