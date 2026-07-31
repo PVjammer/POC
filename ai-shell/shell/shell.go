@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -56,6 +58,8 @@ type Shell struct {
 	lastCmd      string
 	lastExitCode int
 	lastStderr   string
+
+	withCtx *withContext // non-nil while a /with capture context is active
 }
 
 // New creates and wires up the shell.
@@ -80,7 +84,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	completer := NewHybridCompleter(append(metaCommands(), fnLoader.Names()...))
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            buildPrompt(nil, appCfg.Prompt, ""),
+		Prompt:            buildPrompt(nil, appCfg.Prompt, "", ""),
 		HistoryFile:       filepath.Join(os.Getenv("HOME"), ".ai_shell_history"),
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
@@ -113,10 +117,16 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	}
 	s.jobs.onComplete = s.maybeNotify
 
-	// Create the main session.
+	// Create the main session, then restore persisted history if available.
 	mainSess, err := s.createSession("main", "", nil, shellSlots, 0)
 	if err != nil {
 		return nil, fmt.Errorf("create main session: %w", err)
+	}
+	if data, rerr := os.ReadFile(config.SessionPath("main")); rerr == nil {
+		var hist []llm.ChatMessage
+		if json.Unmarshal(data, &hist) == nil && len(hist) > 0 {
+			mainSess.loop.SetHistory(hist)
+		}
 	}
 
 	if os.Getenv("BAISH_DEBUG") != "" {
@@ -133,6 +143,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 // Run starts the interactive loop and blocks until the user exits.
 func (s *Shell) Run() error {
 	defer s.rl.Close()
+	defer s.saveMainSession()
 
 	fmt.Printf("ai-shell  model=%s  endpoint=%s\n", s.cfg.Model, s.cfg.Endpoint)
 	fmt.Println("  <cmd>          shell command  (ls, vim, git, ...)")
@@ -147,7 +158,7 @@ func (s *Shell) Run() error {
 		for _, msg := range s.jobs.drain() {
 			fmt.Println(msg)
 		}
-		s.rl.SetPrompt(buildPrompt(s.jobs, s.appCfg.Prompt, s.activeSession))
+		s.rl.SetPrompt(s.currentPrompt())
 
 		line, err := s.rl.Readline()
 		if err != nil {
@@ -226,11 +237,33 @@ func (s *Shell) runDirect(cmdStr string) {
 	s.lastCmd = cmdStr
 	s.lastStderr = ""
 
+	// When a /with context is active, record the command and tee all output
+	// into the capture buffer. A defer finalizes the exit code entry and
+	// auto-triggers if --on-error is set and the command fails.
+	if s.withCtx != nil {
+		fmt.Fprintf(&s.withCtx.buf, "$ %s\n", cmdStr)
+		defer func() {
+			if s.withCtx == nil {
+				return
+			}
+			fmt.Fprintf(&s.withCtx.buf, "[exit: %d]\n\n", s.lastExitCode)
+			s.withCtx.cmdCount++
+			if s.withCtx.onError && s.lastExitCode != 0 {
+				s.triggerWith()
+			}
+		}()
+	}
+
 	var stderrBuf bytes.Buffer
 	c := exec.Command("sh", "-c", cmdStr)
 	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout
-	c.Stderr = &teeWriter{w1: os.Stderr, w2: &stderrBuf}
+	if s.withCtx != nil {
+		c.Stdout = io.MultiWriter(os.Stdout, &s.withCtx.buf)
+		c.Stderr = io.MultiWriter(os.Stderr, &stderrBuf, &s.withCtx.buf)
+	} else {
+		c.Stdout = os.Stdout
+		c.Stderr = &teeWriter{w1: os.Stderr, w2: &stderrBuf}
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -578,6 +611,9 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			fmt.Println("  Generates a commit message from staged git changes.")
 			fmt.Println("  Stage changes with 'git add' before running.")
 			return false
+		case "with":
+			s.printWithHelp()
+			return false
 		}
 	}
 
@@ -629,10 +665,25 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 	case "commit-msg", "commit", "cm":
 		s.runCommitMsg()
 
+	case "with":
+		s.runWith(args)
+
 	case "exit", "quit", "q":
 		return true
 
 	default:
+		// Check if this is a /with trigger command (e.g. /debug closes /with debug).
+		if _, ok := withModes[name]; ok {
+			if s.withCtx != nil && s.withCtx.name == name {
+				s.triggerWith()
+			} else if s.withCtx != nil {
+				fmt.Fprintf(os.Stderr, "with: active context is /%s, not /%s — run /%s to trigger\n",
+					s.withCtx.name, name, s.withCtx.name)
+			} else {
+				fmt.Fprintf(os.Stderr, "with: no active context — run /with %s first\n", name)
+			}
+			return false
+		}
 		fmt.Fprintf(os.Stderr, "unknown command: /%s  (try /help)\n", name)
 	}
 	return false
@@ -977,6 +1028,8 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /job <N|name> | grep foo  pipe job output through bash")
 	fmt.Println("  /job <N|name> | /ctx add <name>  store job output in context")
 	fmt.Println("  /commit-msg (/cm)  generate a commit message from staged git changes")
+	fmt.Println("  /with <mode>       start output capture for AI analysis (see /with --help)")
+	fmt.Println("  /debug             trigger /with debug analysis")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model and endpoint")
@@ -1543,7 +1596,16 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func buildPrompt(jobs *jobManager, cfg config.PromptConfig, session string) string {
+// currentPrompt builds the readline prompt string for the current shell state.
+func (s *Shell) currentPrompt() string {
+	withLabel := ""
+	if s.withCtx != nil {
+		withLabel = fmt.Sprintf("[with:%s ↑%d %s]", s.withCtx.name, s.withCtx.cmdCount, humanSize(s.withCtx.buf.Len()))
+	}
+	return buildPrompt(s.jobs, s.appCfg.Prompt, s.activeSession, withLabel)
+}
+
+func buildPrompt(jobs *jobManager, cfg config.PromptConfig, session string, withLabel string) string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = "?"
@@ -1566,6 +1628,11 @@ func buildPrompt(jobs *jobManager, cfg config.PromptConfig, session string) stri
 	if session != "" && session != "main" {
 		sb.WriteByte(' ')
 		sb.WriteString(colorize("["+session+"]", "cyan"))
+	}
+
+	if withLabel != "" {
+		sb.WriteByte(' ')
+		sb.WriteString(colorize(withLabel, "yellow"))
 	}
 
 	if jobs != nil {
@@ -1698,7 +1765,7 @@ func (s *Shell) maybeNotify(j *job) {
 	// Print via readline's wrapped stderr: clears prompt, writes line, redraws.
 	fmt.Fprintln(s.rl.Stderr(), line)
 	// Update prompt to reflect new job counts, then redraw.
-	s.rl.SetPrompt(buildPrompt(s.jobs, s.appCfg.Prompt, s.activeSession))
+	s.rl.SetPrompt(s.currentPrompt())
 	s.rl.Refresh()
 	// Drain so the main loop's drain() finds nothing to re-print.
 	s.jobs.drain()
@@ -1835,5 +1902,29 @@ func wordWrap(text string, width int) []string {
 }
 
 func metaCommands() []string {
-	return []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "cm", "exit"}
+	cmds := []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "cm", "with", "exit"}
+	for name := range withModes {
+		cmds = append(cmds, name)
+	}
+	return cmds
+}
+
+// saveMainSession persists the main session's conversation history to disk.
+func (s *Shell) saveMainSession() {
+	sess, ok := s.sessions["main"]
+	if !ok {
+		return
+	}
+	hist := sess.loop.CopyHistory()
+	if len(hist) == 0 {
+		return
+	}
+	data, err := json.Marshal(hist)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(config.SessionsDir(), 0755); err != nil {
+		return
+	}
+	_ = os.WriteFile(config.SessionPath("main"), data, 0644)
 }

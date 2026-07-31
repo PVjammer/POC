@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/pvjammer/ai-shell-poc/config"
 )
 
 type jobStatus int
@@ -38,7 +40,9 @@ type jobManager struct {
 }
 
 func newJobManager() *jobManager {
-	return &jobManager{names: make(map[string]int)}
+	// Start numbering above the highest ID already on disk so in-shell job IDs
+	// never collide with previously persisted jobs.
+	return &jobManager{names: make(map[string]int), nextID: config.MaxJobID()}
 }
 
 // start launches fn in a goroutine, tracks the job, and returns its ID.
@@ -92,6 +96,9 @@ func (m *jobManager) start(display, name string, fn func() (string, error)) (int
 		m.unreadDone++
 		cb := m.onComplete
 		m.mu.Unlock()
+
+		// Persist to disk so the job is retrievable via `baish job <id>` from any shell.
+		_ = config.SaveJob(id, j.name, display, output, err != nil, elapsed, j.startedAt)
 
 		if cb != nil {
 			cb(j)

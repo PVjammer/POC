@@ -4,11 +4,21 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/pvjammer/ai-shell-poc/cli"
 	"github.com/pvjammer/ai-shell-poc/config"
 	"github.com/pvjammer/ai-shell-poc/shell"
 )
 
 func main() {
+	// If the first argument is a known CLI subcommand, dispatch to CLI mode.
+	// Otherwise start the interactive shell as usual.
+	if len(os.Args) > 1 && cli.Subcommands[os.Args[1]] {
+		if err := cli.Run(os.Args[1:]); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	appCfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ai-shell: config warning: %v (using defaults)\n", err)
