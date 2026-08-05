@@ -148,3 +148,4 @@ func FindJobByName(name string) int {
 func SessionPath(name string) string {
 	return filepath.Join(SessionsDir(), name+".json")
 }
+

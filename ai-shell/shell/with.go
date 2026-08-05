@@ -51,7 +51,7 @@ var withModes = map[string]withModeConfig{
 	},
 }
 
-// withContext holds the state for an active /with capture context.
+// withContext holds the in-memory state for one active /with capture buffer.
 type withContext struct {
 	name     string
 	onError  bool
@@ -69,30 +69,16 @@ func (s *Shell) runWith(args []string) {
 
 	switch args[0] {
 	case "status":
-		if s.withCtx == nil {
-			fmt.Fprintln(os.Stderr, "with: no active capture context")
-			return
-		}
-		fmt.Printf("[with:%s  %s  %d cmd(s)  %.1fs]\n",
-			s.withCtx.name, humanSize(s.withCtx.buf.Len()),
-			s.withCtx.cmdCount, time.Since(s.withCtx.started).Seconds())
+		s.withStatus(args[1:])
 
 	case "clear":
-		if s.withCtx == nil {
-			fmt.Fprintln(os.Stderr, "with: no active capture context")
-			return
-		}
-		s.withCtx.buf.Reset()
-		s.withCtx.cmdCount = 0
-		fmt.Printf("[with:%s buffer cleared]\n", s.withCtx.name)
+		s.withClear(args[1:])
 
 	case "end", "discard", "cancel":
-		if s.withCtx == nil {
-			fmt.Fprintln(os.Stderr, "with: no active capture context")
-			return
-		}
-		fmt.Printf("[with:%s discarded]\n", s.withCtx.name)
-		s.withCtx = nil
+		s.withEnd(args[1:])
+
+	case "recover":
+		s.withRecover(args[1:])
 
 	default:
 		name := args[0]
@@ -101,9 +87,9 @@ func (s *Shell) runWith(args []string) {
 				name, strings.Join(s.withModeNames(), ", "))
 			return
 		}
-		if s.withCtx != nil {
-			fmt.Fprintf(os.Stderr, "with: already capturing %q — /%s to trigger, /with end to discard\n",
-				s.withCtx.name, s.withCtx.name)
+		if _, exists := s.withCtxs[name]; exists {
+			fmt.Fprintf(os.Stderr, "with: %q is already active — /%s to trigger, /with end %s to discard\n",
+				name, name, name)
 			return
 		}
 		onError := false
@@ -112,7 +98,7 @@ func (s *Shell) runWith(args []string) {
 				onError = true
 			}
 		}
-		s.withCtx = &withContext{
+		s.withCtxs[name] = &withContext{
 			name:    name,
 			onError: onError,
 			started: time.Now(),
@@ -129,17 +115,146 @@ func (s *Shell) runWith(args []string) {
 	}
 }
 
-// triggerWith fires the configured action for the active capture context.
-// args are passed from the closing command (e.g. slot name for /context notes).
-// Clears s.withCtx before acting so nested capture cannot occur.
-func (s *Shell) triggerWith(args []string) {
-	if s.withCtx == nil {
+func (s *Shell) withStatus(args []string) {
+	if len(s.withCtxs) == 0 {
+		fmt.Fprintln(os.Stderr, "with: no active capture contexts")
 		return
 	}
-	ctx := s.withCtx
-	s.withCtx = nil
+	if len(args) > 0 {
+		name := args[0]
+		ctx, ok := s.withCtxs[name]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "with: no active %q context\n", name)
+			return
+		}
+		fmt.Printf("[with:%s  %s  %d cmd(s)  %.1fs]\n",
+			name, humanSize(ctx.buf.Len()), ctx.cmdCount, time.Since(ctx.started).Seconds())
+		return
+	}
+	for _, name := range s.withModeNames() {
+		ctx, ok := s.withCtxs[name]
+		if !ok {
+			continue
+		}
+		fmt.Printf("[with:%s  %s  %d cmd(s)  %.1fs]\n",
+			name, humanSize(ctx.buf.Len()), ctx.cmdCount, time.Since(ctx.started).Seconds())
+	}
+}
 
-	modeCfg := withModes[ctx.name]
+func (s *Shell) withClear(args []string) {
+	if len(s.withCtxs) == 0 {
+		fmt.Fprintln(os.Stderr, "with: no active capture contexts")
+		return
+	}
+	if len(args) > 0 {
+		name := args[0]
+		ctx, ok := s.withCtxs[name]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "with: no active %q context\n", name)
+			return
+		}
+		ctx.buf.Reset()
+		ctx.cmdCount = 0
+		fmt.Printf("[with:%s buffer cleared]\n", name)
+		return
+	}
+	// No name given: require one if multiple are active.
+	if len(s.withCtxs) > 1 {
+		fmt.Fprintf(os.Stderr, "with: multiple contexts active — specify one: /with clear <name>\n")
+		return
+	}
+	for name, ctx := range s.withCtxs {
+		ctx.buf.Reset()
+		ctx.cmdCount = 0
+		fmt.Printf("[with:%s buffer cleared]\n", name)
+	}
+}
+
+func (s *Shell) withEnd(args []string) {
+	if len(s.withCtxs) == 0 {
+		fmt.Fprintln(os.Stderr, "with: no active capture contexts")
+		return
+	}
+	if len(args) > 0 {
+		name := args[0]
+		if name == "all" {
+			for name := range s.withCtxs {
+				delete(s.withCtxs, name)
+				fmt.Printf("[with:%s discarded]\n", name)
+			}
+			return
+		}
+		if _, ok := s.withCtxs[name]; !ok {
+			fmt.Fprintf(os.Stderr, "with: no active %q context\n", name)
+			return
+		}
+		delete(s.withCtxs, name)
+		fmt.Printf("[with:%s discarded]\n", name)
+		return
+	}
+	// No name given: discard the single active context, or require a name.
+	if len(s.withCtxs) > 1 {
+		fmt.Fprintf(os.Stderr, "with: multiple contexts active — specify one: /with end <name>  or  /with end all\n")
+		return
+	}
+	for name := range s.withCtxs {
+		delete(s.withCtxs, name)
+		fmt.Printf("[with:%s discarded]\n", name)
+	}
+}
+
+// withRecover loads a saved buffer and dispatches it immediately to the agent.
+// Recovery is a one-shot trigger — it does not create an active capture context.
+func (s *Shell) withRecover(args []string) {
+	if len(args) == 0 {
+		records, err := config.LoadWiths()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "with: recover: %v\n", err)
+			return
+		}
+		if len(records) == 0 {
+			fmt.Println("(no saved /with buffers)")
+			return
+		}
+		fmt.Printf("  %-12s  %-8s  %s\n", "NAME", "CMDS", "SAVED")
+		for _, r := range records {
+			fmt.Printf("  %-12s  %-8d  %s\n", r.Name, r.CmdCount, r.Saved.Format("2006-01-02 15:04"))
+		}
+		return
+	}
+
+	name := args[0]
+	if _, ok := withModes[name]; !ok {
+		fmt.Fprintf(os.Stderr, "with: recover: unknown mode %q\n", name)
+		return
+	}
+
+	rec, content, err := config.LoadWith(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "with: recover: %v\n", err)
+		return
+	}
+
+	fmt.Printf("\n\033[2m[with:%s recovered — %d cmd(s), %s, originally %.0fs ago]\033[0m\n\n",
+		name, rec.CmdCount, humanSize(len(content)), time.Since(rec.Started).Seconds())
+
+	modeCfg := withModes[name]
+	s.syncAgentContext()
+	s.dispatchWith(name, modeCfg, rec.CmdCount, rec.Started, content, args[1:])
+
+	// Delete saved file only after successful dispatch setup.
+	_ = config.DeleteWith(name)
+}
+
+// triggerWith looks up the named active context, removes it, and dispatches.
+func (s *Shell) triggerWith(name string, args []string) {
+	ctx, ok := s.withCtxs[name]
+	if !ok {
+		return
+	}
+	delete(s.withCtxs, name)
+
+	modeCfg := withModes[name]
 	content := ctx.buf.String()
 
 	if strings.TrimSpace(content) == "" {
@@ -148,10 +263,17 @@ func (s *Shell) triggerWith(args []string) {
 	}
 
 	fmt.Printf("\n\033[2m[with:%s — %d cmd(s), %s, %.1fs]\033[0m\n\n",
-		ctx.name, ctx.cmdCount, humanSize(len(content)), time.Since(ctx.started).Seconds())
+		name, ctx.cmdCount, humanSize(len(content)), time.Since(ctx.started).Seconds())
 
+	s.syncAgentContext()
+	s.dispatchWith(name, modeCfg, ctx.cmdCount, ctx.started, content, args)
+}
+
+// dispatchWith executes the configured action for a capture context.
+// Shared by triggerWith (live context) and withRecover (saved snapshot).
+func (s *Shell) dispatchWith(name string, cfg withModeConfig, cmdCount int, started time.Time, content string, args []string) {
 	// Store action: write buffer directly into a ctx slot, no AI involved.
-	if modeCfg.action == withActionStore {
+	if cfg.action == withActionStore {
 		slotName := "capture"
 		if len(args) > 0 && args[0] != "" {
 			slotName = args[0]
@@ -171,7 +293,7 @@ func (s *Shell) triggerWith(args []string) {
 
 	var prompt string
 	if len(content) <= inlineThreshold {
-		prompt = withPromptInline(ctx.name, content)
+		prompt = withPromptInline(name, content)
 	} else {
 		f, err := os.CreateTemp("", "baish-with-*.txt")
 		if err != nil {
@@ -180,19 +302,15 @@ func (s *Shell) triggerWith(args []string) {
 		}
 		_, _ = io.WriteString(f, content)
 		f.Close()
-		prompt = withPromptFile(ctx.name, f.Name())
+		prompt = withPromptFile(name, f.Name())
 	}
 
-	s.syncAgentContext()
-	if modeCfg.agentic {
-		s.runAgentAct(prompt)
-	} else {
-		s.runAgent(prompt)
-	}
+	// Dispatch as isolated one-shot — must not pollute the main conversation history.
+	s.runAgentDispatch(prompt, cfg.agentic)
 }
 
-func withPromptInline(mode, content string) string {
-	switch mode {
+func withPromptInline(name, content string) string {
+	switch name {
 	case "debug":
 		return `Debug capture session:
 
@@ -235,8 +353,8 @@ Focus on: sequences run more than once, long commands that could be wrapped, mul
 	return content
 }
 
-func withPromptFile(mode, path string) string {
-	switch mode {
+func withPromptFile(name, path string) string {
+	switch name {
 	case "debug":
 		return fmt.Sprintf(`Debug capture was written to: %s
 
@@ -293,10 +411,11 @@ func (s *Shell) withModeNames() []string {
 
 func (s *Shell) printWithHelp() {
 	fmt.Println("usage: /with <mode> [--on-error]")
-	fmt.Println("       /with status | clear | end")
+	fmt.Println("       /with status [name] | clear [name] | end [name|all] | recover [name]")
 	fmt.Println()
-	fmt.Println("  Capture command output for later AI analysis or storage.")
-	fmt.Println("  Type /<mode> to close the context and trigger the action.")
+	fmt.Println("  Capture command output for AI analysis or storage.")
+	fmt.Println("  Type /<mode> to close that context and trigger its action.")
+	fmt.Println("  Multiple different modes may be active simultaneously.")
 	fmt.Println()
 	fmt.Println("  Modes:")
 	for _, name := range s.withModeNames() {
@@ -305,19 +424,20 @@ func (s *Shell) printWithHelp() {
 		if cfg.action == withActionStore {
 			closing = "/" + name + " [slot]"
 		}
-		fmt.Printf("    %-12s  %-20s  %s\n", name, closing, cfg.description)
+		fmt.Printf("    %-12s  %-22s  %s\n", name, closing, cfg.description)
 	}
 	fmt.Println()
-	fmt.Println("  --on-error   auto-trigger when a command exits non-zero (analyze modes only)")
+	fmt.Println("  --on-error   auto-trigger on first non-zero exit (analyze modes)")
 	fmt.Println()
 	fmt.Println("  Management:")
-	fmt.Println("    /with status   show buffer size and elapsed time")
-	fmt.Println("    /with clear    reset buffer without closing")
-	fmt.Println("    /with end      discard and close without triggering")
+	fmt.Println("    /with status [name]    show buffer size(s) and elapsed time")
+	fmt.Println("    /with clear [name]     reset buffer without closing")
+	fmt.Println("    /with end [name|all]   discard and close without triggering")
+	fmt.Println("    /with recover [name]   trigger a saved buffer from a previous session")
 	fmt.Println()
 	fmt.Println("  Examples:")
-	fmt.Println("    /with debug             capture commands; /debug to trigger")
-	fmt.Println("    /with debug --on-error  auto-trigger on first non-zero exit")
-	fmt.Println("    /with recap             capture session; /recap for standup summary")
-	fmt.Println("    /with context           capture output; /context notes to store as ctx slot")
+	fmt.Println("    /with recap                   start session capture")
+	fmt.Println("    /with debug --on-error         auto-trigger on first error")
+	fmt.Println("    /with recap  +  /with debug    both active simultaneously")
+	fmt.Println("    /with context  →  /context notes   store output as ctx slot 'notes'")
 }

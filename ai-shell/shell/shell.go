@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/ergochat/readline"
 	"github.com/pvjammer/ai-shell-poc/agent"
+	"github.com/pvjammer/ai-shell-poc/backend"
 	"github.com/pvjammer/ai-shell-poc/config"
 	"github.com/pvjammer/ai-shell-poc/functions"
 	"github.com/pvjammer/ai-shell-poc/permissions"
@@ -33,8 +35,12 @@ type shellCtxSlot struct {
 
 // Config holds runtime configuration for the shell (LLM connection).
 type Config struct {
-	Model    string
-	Endpoint string
+	Model         string
+	Endpoint      string
+	OpenCodeURL   string // non-empty = route agent calls through opencode serve
+	OpenCodeModel string // "providerID/modelID" e.g. "opencode/big-pickle"; empty = server default
+	ResumeSession string // session ID to resume (from --resume flag); empty = start fresh
+	Version       string // injected at build time via ldflags; "dev" when unset
 }
 
 // Shell is the main REPL.
@@ -59,7 +65,9 @@ type Shell struct {
 	lastExitCode int
 	lastStderr   string
 
-	withCtx *withContext // non-nil while a /with capture context is active
+	withCtxs map[string]*withContext // active /with capture buffers, keyed by mode name
+
+	ocClient *backend.OpenCodeClient // non-nil when OpenCode backend is configured
 }
 
 // New creates and wires up the shell.
@@ -114,6 +122,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		actHandlers:   baseHandlers,
 		sessions:      make(map[string]*sessionEntry),
 		activeSession: "main",
+		withCtxs:      make(map[string]*withContext),
 	}
 	s.jobs.onComplete = s.maybeNotify
 
@@ -137,6 +146,30 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		}
 	}
 
+	if saved, _ := config.LoadWiths(); len(saved) > 0 {
+		fmt.Fprintf(os.Stderr, "\033[2m%d unsaved /with buffer(s) from a previous session — /with recover to list\033[0m\n", len(saved))
+	}
+
+	if cfg.OpenCodeURL != "" {
+		s.ocClient = backend.NewOpenCodeClient(cfg.OpenCodeURL, cfg.OpenCodeModel)
+		ctx := context.Background()
+		tag := "new"
+		if cfg.ResumeSession != "" {
+			if !s.ocClient.ReuseSession(ctx, cfg.ResumeSession) {
+				return nil, fmt.Errorf("opencode: session %q not found — it may have been deleted or the server was restarted", cfg.ResumeSession)
+			}
+			tag = "resumed"
+		} else {
+			if err := s.ocClient.EnsureSession(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "\033[2m[opencode] session init failed: %v — falling back to local model\033[0m\n", err)
+				s.ocClient = nil
+			}
+		}
+		if s.ocClient != nil {
+			fmt.Fprintf(os.Stderr, "\033[2m[opencode] session %s (%s)\033[0m\n", s.ocClient.SessionID(), tag)
+		}
+	}
+
 	return s, nil
 }
 
@@ -144,8 +177,13 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 func (s *Shell) Run() error {
 	defer s.rl.Close()
 	defer s.saveMainSession()
+	defer s.saveWithContexts()
 
-	fmt.Printf("ai-shell  model=%s  endpoint=%s\n", s.cfg.Model, s.cfg.Endpoint)
+	if s.ocClient != nil {
+		fmt.Printf("baish %s  backend=opencode  url=%s  session=%s\n", s.cfg.Version, s.cfg.OpenCodeURL, s.ocClient.SessionID())
+	} else {
+		fmt.Printf("baish %s  model=%s  endpoint=%s\n", s.cfg.Version, s.cfg.Model, s.cfg.Endpoint)
+	}
 	fmt.Println("  <cmd>          shell command  (ls, vim, git, ...)")
 	fmt.Println("  ?<msg>         ask the AI     (advisory — explains, no execution)")
 	fmt.Println("  !\"<msg>\"       act mode       (AI executes commands; permissions apply)")
@@ -237,29 +275,37 @@ func (s *Shell) runDirect(cmdStr string) {
 	s.lastCmd = cmdStr
 	s.lastStderr = ""
 
-	// When a /with context is active, record the command and tee all output
-	// into the capture buffer. A defer finalizes the exit code entry and
-	// auto-triggers if --on-error is set and the command fails.
-	if s.withCtx != nil {
-		fmt.Fprintf(&s.withCtx.buf, "$ %s\n", cmdStr)
-		defer func() {
-			if s.withCtx == nil {
-				return
-			}
-			fmt.Fprintf(&s.withCtx.buf, "[exit: %d]\n\n", s.lastExitCode)
-			s.withCtx.cmdCount++
-			if s.withCtx.onError && s.lastExitCode != 0 {
-				s.triggerWith(nil)
-			}
-		}()
-	}
-
+	// When one or more /with contexts are active, tee stdout+stderr into every
+	// active buffer simultaneously. A defer finalizes the exit code entry for
+	// each buffer and auto-triggers any that have --on-error set.
 	var stderrBuf bytes.Buffer
 	c := exec.Command("sh", "-c", cmdStr)
 	c.Stdin = os.Stdin
-	if s.withCtx != nil {
-		c.Stdout = io.MultiWriter(os.Stdout, &s.withCtx.buf)
-		c.Stderr = io.MultiWriter(os.Stderr, &stderrBuf, &s.withCtx.buf)
+	if len(s.withCtxs) > 0 {
+		for _, ctx := range s.withCtxs {
+			fmt.Fprintf(&ctx.buf, "$ %s\n", cmdStr)
+		}
+		stdoutW := []io.Writer{os.Stdout}
+		stderrW := []io.Writer{os.Stderr, &stderrBuf}
+		for _, ctx := range s.withCtxs {
+			stdoutW = append(stdoutW, &ctx.buf)
+			stderrW = append(stderrW, &ctx.buf)
+		}
+		c.Stdout = io.MultiWriter(stdoutW...)
+		c.Stderr = io.MultiWriter(stderrW...)
+		defer func() {
+			var toTrigger []string
+			for name, ctx := range s.withCtxs {
+				fmt.Fprintf(&ctx.buf, "[exit: %d]\n\n", s.lastExitCode)
+				ctx.cmdCount++
+				if ctx.onError && s.lastExitCode != 0 {
+					toTrigger = append(toTrigger, name)
+				}
+			}
+			for _, name := range toTrigger {
+				s.triggerWith(name, nil)
+			}
+		}()
 	} else {
 		c.Stdout = os.Stdout
 		c.Stderr = &teeWriter{w1: os.Stderr, w2: &stderrBuf}
@@ -348,6 +394,11 @@ func (s *Shell) advisoryToolSet() []llm.ToolDef {
 
 // runAgentForeground is the shared foreground agent runner for both modes.
 func (s *Shell) runAgentForeground(msg string, act bool) {
+	if s.ocClient != nil {
+		s.runViaOpenCode(msg)
+		return
+	}
+
 	s.sessionMu().Lock()
 	defer s.sessionMu().Unlock()
 	s.setupAgentForMode(act)
@@ -369,13 +420,120 @@ func (s *Shell) runAgentForeground(msg string, act bool) {
 	}
 }
 
+// runViaOpenCode sends a message to the OpenCode serve backend and streams output.
+func (s *Shell) runViaOpenCode(msg string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		_ = s.ocClient.Abort(context.Background())
+		cancel()
+	}()
+
+	fmt.Println()
+	err := s.ocClient.Send(ctx, msg, s.buildOCSystemPrefix(), func(token string) { fmt.Print(token) })
+	fmt.Println()
+
+	if err != nil && err != context.Canceled {
+		fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
+	}
+}
+
 func (s *Shell) runAgent(msg string)    { s.runAgentForeground(msg, false) }
 func (s *Shell) runAgentAct(msg string) { s.runAgentForeground(msg, true) }
+
+// runAgentDispatch runs the agent for a /with dispatch — fully isolated from the
+// main conversation history so the captured analysis never bleeds into follow-up turns.
+//
+// Local model: history is saved before dispatch and restored after.
+// OpenCode: a throwaway session is created and deleted when done.
+func (s *Shell) runAgentDispatch(msg string, act bool) {
+	if s.ocClient != nil {
+		s.runViaOpenCodeDisposable(msg)
+		return
+	}
+
+	sess := s.currentSession()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	// Snapshot and clear — the dispatch runs with a clean slate.
+	savedHistory := sess.loop.CopyHistory()
+	sess.loop.ClearHistory()
+	defer sess.loop.SetHistory(savedHistory)
+
+	if act {
+		sess.loop.SetTools(s.actTools, s.makeSessionHandlers(sess))
+		sess.loop.SetSystemPrompt("")
+	} else {
+		sess.loop.SetTools(s.advisoryToolSet(), s.makeSessionHandlers(sess))
+		sess.loop.SetSystemPrompt(agent.AdvisorySystemPrompt)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() { <-sigCh; cancel() }()
+
+	fmt.Println()
+	err := sess.loop.Run(ctx, msg, func(token string) { fmt.Print(token) })
+	fmt.Println()
+
+	if err != nil && err != context.Canceled {
+		fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
+	}
+}
+
+// runViaOpenCodeDisposable sends one message via a throwaway OpenCode session
+// that is deleted when the call returns, keeping the main session clean.
+func (s *Shell) runViaOpenCodeDisposable(msg string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tmp := backend.NewOpenCodeClient(s.cfg.OpenCodeURL, s.cfg.OpenCodeModel)
+	if err := tmp.EnsureSession(ctx); err != nil {
+		// Fall back to main session rather than silently dropping the dispatch.
+		fmt.Fprintf(os.Stderr, "\033[2m[with] disposable session failed (%v) — using main session\033[0m\n", err)
+		s.runViaOpenCode(msg)
+		return
+	}
+	defer tmp.DeleteSession(context.Background())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		_ = tmp.Abort(context.Background())
+		cancel()
+	}()
+
+	fmt.Println()
+	err := tmp.Send(ctx, msg, s.buildOCSystemPrefix(), func(token string) { fmt.Print(token) })
+	fmt.Println()
+
+	if err != nil && err != context.Canceled {
+		fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
+	}
+}
 
 // runAgentCapture runs the agent in capture mode (no terminal output).
 // Spinner is suppressed — runs in a background goroutine and would corrupt
 // the foreground terminal cursor if allowed to write.
 func (s *Shell) runAgentCapture(ctx context.Context, msg string, act bool) (string, error) {
+	if s.ocClient != nil {
+		var buf strings.Builder
+		err := s.ocClient.Send(ctx, msg, s.buildOCSystemPrefix(), func(token string) { buf.WriteString(token) })
+		return strings.TrimSpace(buf.String()), err
+	}
+
 	sess := s.currentSession() // snapshot at call time — safe for background jobs
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -604,7 +762,11 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			s.runPermissions(nil)
 			return false
 		case "model":
-			fmt.Printf("usage: /model <name> [endpoint]\nmodel: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+			if s.ocClient != nil {
+				fmt.Printf("usage: /model <name> [endpoint]\nbackend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
+			} else {
+				fmt.Printf("usage: /model <name> [endpoint]\nmodel: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+			}
 			return false
 		case "commit-msg", "commit", "cm":
 			fmt.Println("usage: /commit-msg")
@@ -635,13 +797,20 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 	case "config":
 		s.runConfig(args)
 
+	case "version", "v":
+		fmt.Println(s.cfg.Version)
+
 	case "clear":
 		s.activeLoop().ClearHistory()
 		fmt.Println("conversation history cleared")
 
 	case "model":
 		if len(args) == 0 {
-			fmt.Printf("model: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+			if s.ocClient != nil {
+				fmt.Printf("backend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
+			} else {
+				fmt.Printf("model: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+			}
 		} else {
 			model := args[0]
 			endpoint := s.cfg.Endpoint
@@ -683,13 +852,10 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 				s.printWithHelp()
 				return false
 			}
-			if s.withCtx != nil && s.withCtx.name == name {
-				s.triggerWith(args)
-			} else if s.withCtx != nil {
-				fmt.Fprintf(os.Stderr, "with: active context is /%s, not /%s — run /%s to trigger\n",
-					s.withCtx.name, name, s.withCtx.name)
+			if _, active := s.withCtxs[name]; active {
+				s.triggerWith(name, args)
 			} else {
-				fmt.Fprintf(os.Stderr, "with: no active context — run /with %s first\n", name)
+				fmt.Fprintf(os.Stderr, "with: no active /%s context — run /with %s first\n", name, name)
 			}
 			return false
 		}
@@ -1611,8 +1777,17 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 // currentPrompt builds the readline prompt string for the current shell state.
 func (s *Shell) currentPrompt() string {
 	withLabel := ""
-	if s.withCtx != nil {
-		withLabel = fmt.Sprintf("[with:%s ↑%d %s]", s.withCtx.name, s.withCtx.cmdCount, humanSize(s.withCtx.buf.Len()))
+	if len(s.withCtxs) > 0 {
+		names := make([]string, 0, len(s.withCtxs))
+		for name := range s.withCtxs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		parts := make([]string, 0, len(names))
+		for _, name := range names {
+			parts = append(parts, fmt.Sprintf("%s↑%d", name, s.withCtxs[name].cmdCount))
+		}
+		withLabel = "[with:" + strings.Join(parts, ",") + "]"
 	}
 	return buildPrompt(s.jobs, s.appCfg.Prompt, s.activeSession, withLabel)
 }
@@ -1921,7 +2096,49 @@ func metaCommands() []string {
 	return cmds
 }
 
-// saveMainSession persists the main session's conversation history to disk.
+// saveWithContexts persists any unclosed /with buffers to disk on shutdown.
+// Each buffer is saved as a separate artifact that can be recovered via
+// /with recover in the next session.
+func (s *Shell) saveWithContexts() {
+	for name, ctx := range s.withCtxs {
+		if ctx.buf.Len() == 0 {
+			continue
+		}
+		rec := config.WithRecord{
+			Name:     name,
+			OnError:  ctx.onError,
+			CmdCount: ctx.cmdCount,
+			Started:  ctx.started,
+			Saved:    time.Now(),
+		}
+		if err := config.SaveWith(name, ctx.buf.String(), rec); err != nil {
+			fmt.Fprintf(os.Stderr, "with: warning: could not save %q buffer: %v\n", name, err)
+		} else {
+			fmt.Printf("[with:%s buffer saved — /with recover %s to restore]\n", name, name)
+		}
+	}
+}
+
+// buildOCSystemPrefix returns a brief shell-state string injected into every
+// OpenCode message via the `system` field, giving the model the same context
+// awareness it has with the local agent loop.
+func (s *Shell) buildOCSystemPrefix() string {
+	cwd, _ := os.Getwd()
+	var b strings.Builder
+	fmt.Fprintf(&b, "Shell state:\n  cwd: %s", cwd)
+	if s.lastCmd != "" {
+		fmt.Fprintf(&b, "\n  last command: %s\n  exit code: %d", s.lastCmd, s.lastExitCode)
+		if s.lastExitCode != 0 && s.lastStderr != "" {
+			stderr := s.lastStderr
+			if len(stderr) > 500 {
+				stderr = stderr[:500] + "..."
+			}
+			fmt.Fprintf(&b, "\n  stderr: %s", stderr)
+		}
+	}
+	return b.String()
+}
+
 func (s *Shell) saveMainSession() {
 	sess, ok := s.sessions["main"]
 	if !ok {

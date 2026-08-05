@@ -2,12 +2,14 @@ BIN      := baish
 BIN_DIR  ?= $(HOME)/.local/bin
 GO       := go
 
+VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+PKG      := main
+LDFLAGS  := -X '$(PKG).Version=$(VERSION)'
+
 .PHONY: all build install clean test
 
-all: install
-
 build:
-	$(GO) build -o $(BIN) ./cmd/shell/
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/shell/
 	chmod +x $(BIN)
 
 install: build
