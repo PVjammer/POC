@@ -55,7 +55,7 @@ func Defaults() Config {
 		ToolOverflow:           OverflowTruncate,
 		CtxInlineThreshold:     4096,
 		ToolOutputKeepRounds:   3,
-		MaxContextTokens:       8192,
+		MaxContextTokens:       32768,
 		CompactionThreshold:    0.75,
 		CompactionTailMessages: 20,
 		MaxResponseTokens:      16384,

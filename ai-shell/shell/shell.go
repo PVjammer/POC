@@ -199,6 +199,9 @@ func (s *Shell) Run() error {
 		s.rl.SetPrompt(s.currentPrompt())
 
 		line, err := s.rl.Readline()
+		if err == readline.ErrInterrupt {
+			continue // Ctrl+C at prompt clears the line; don't exit baish
+		}
 		if err != nil {
 			fmt.Println("exit")
 			break
@@ -354,7 +357,7 @@ func (s *Shell) setupAgentForMode(act bool) {
 	sess := s.currentSession()
 	handlers := s.makeSessionHandlers(sess)
 	if act {
-		sess.loop.SetTools(s.actTools, handlers)
+		sess.loop.SetTools(s.agentToolSet(), handlers)
 		sess.loop.SetSystemPrompt("")
 	} else {
 		advisoryDefs := s.advisoryToolSet()
@@ -368,17 +371,27 @@ func (s *Shell) setupAgentForMode(act bool) {
 // the function registry are agentic-only by default.
 var advisoryToolAllowlist = map[string]bool{
 	// Context / introspection (baish built-ins, always safe).
-	"read_context": true,
+	"read_context":  true,
 	"describe_tool": true,
-	// Filesystem reads (no mutation).
+	// Filesystem reads (no mutation). These are the primary read-only enforcement
+	// mechanism for ? mode — they give the model file access without bash.
 	"read_file":  true,
 	"list_files": true,
 	// Web (read-only network access).
 	"web_search": true,
 	// Pure text computation (no I/O).
-	"summarize":       true,
-	"extract_data":    true,
-	"text_transform":  true,
+	"summarize":      true,
+	"extract_data":   true,
+	"text_transform": true,
+}
+
+// actToolDenylist excludes tools from ! (agentic) mode that are redundant with
+// bash and produce worse output. list_files and read_file return structured blobs
+// that are harder for the model to reason over than plain bash output; bash with
+// grep/find/cat handles these tasks more effectively.
+var actToolDenylist = map[string]bool{
+	"list_files": true,
+	"read_file":  true,
 }
 
 // advisoryToolSet returns the subset of actTools permitted in advisory mode.
@@ -386,6 +399,17 @@ func (s *Shell) advisoryToolSet() []llm.ToolDef {
 	var out []llm.ToolDef
 	for _, t := range s.actTools {
 		if advisoryToolAllowlist[t.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// agentToolSet returns actTools minus tools that are redundant with bash.
+func (s *Shell) agentToolSet() []llm.ToolDef {
+	var out []llm.ToolDef
+	for _, t := range s.actTools {
+		if !actToolDenylist[t.Name] {
 			out = append(out, t)
 		}
 	}
@@ -467,7 +491,7 @@ func (s *Shell) runAgentDispatch(msg string, act bool) {
 	defer sess.loop.SetHistory(savedHistory)
 
 	if act {
-		sess.loop.SetTools(s.actTools, s.makeSessionHandlers(sess))
+		sess.loop.SetTools(s.agentToolSet(), s.makeSessionHandlers(sess))
 		sess.loop.SetSystemPrompt("")
 	} else {
 		sess.loop.SetTools(s.advisoryToolSet(), s.makeSessionHandlers(sess))

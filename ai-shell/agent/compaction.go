@@ -8,29 +8,42 @@ import (
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
-// runCompaction summarizes the middle portion of conversation history with an
-// LLM call, replacing it with a single structured summary message. The head
-// (first exchange) and tail (last CompactionTailMessages messages) are always
-// kept verbatim. This is non-destructive: a compaction failure leaves
-// l.history unchanged so the caller can continue normally.
+// runCompaction summarizes the portion of conversation history that predates
+// the current turn, replacing it with a structured summary message. The split
+// is turn-boundary-aware: everything from l.turnStart onward (the current
+// turn's user message and all subsequent agent actions) is always kept
+// verbatim. Only the history before l.turnStart is eligible for compaction.
+//
+// Structure after compaction:
+//
+//	[first exchange head] [summary block] [current user message] [current turn actions]
+//
+// Falls back to the CompactionTailMessages count when turnStart is unavailable.
+// Non-destructive: a compaction failure leaves l.history unchanged.
 func (l *Loop) runCompaction(ctx context.Context) error {
 	hist := l.history
-
 	headEnd := findHeadEnd(hist)
-	tailStart := findTailStart(hist, l.cfg.CompactionTailMessages)
+
+	// Determine the anchor: the index of the current turn's user message.
+	// Everything at or after anchorIdx is kept verbatim.
+	anchorIdx := l.turnStart
+	if anchorIdx <= headEnd || anchorIdx >= len(hist) {
+		// turnStart not set or already inside the head — fall back to tail count.
+		anchorIdx = findTailStart(hist, l.cfg.CompactionTailMessages)
+	}
 
 	// Nothing useful in the middle to compact.
-	if tailStart <= headEnd+2 {
+	if anchorIdx <= headEnd+2 {
 		return nil
 	}
 
-	head := hist[:headEnd]
-	middle := hist[headEnd:tailStart]
-	tail := hist[tailStart:]
+	head   := hist[:headEnd]
+	middle := hist[headEnd:anchorIdx]
+	tail   := hist[anchorIdx:] // tail[0] is always the verbatim current user message
 
 	prompt := l.buildCompactionPrompt(middle)
 
-	opts := llm.DefaultOptions().WithMaxTokens(600).WithTemperature(0.1)
+	opts := llm.DefaultOptions().WithMaxTokens(1000).WithTemperature(0.1)
 	ch := l.provider.Ainvoke(ctx, prompt, opts)
 	resp, err := llm.CollectResponse(ctx, ch)
 	if err != nil {
@@ -52,6 +65,9 @@ func (l *Loop) runCompaction(ctx context.Context) error {
 	rebuilt = append(rebuilt, tail...)
 	l.history = rebuilt
 
+	// Update turnStart to reflect the user message's new position.
+	l.turnStart = len(head) + 1 // after head + summary block
+
 	l.compactionSummary = summary
 	l.compactionDepth++
 	return nil
@@ -71,11 +87,15 @@ func (l *Loop) buildCompactionPrompt(middle []llm.ChatMessage) string {
 **Open Questions:** Unresolved issues or pending decisions
 **Next Steps:** What should happen next
 
+Note: this summary replaces the compacted history. The agent knows it is working from a summary and may request earlier details if needed.
+
 Conversation:
 %s`, histText)
 	}
 
 	return fmt.Sprintf(`Update this session summary to incorporate the new conversation below. Move completed items from "Next Steps" to "Progress". Add new decisions, files, and errors. Remove information that is no longer relevant. Return only the updated summary in the same structured format.
+
+Note: this summary replaces the compacted history. The agent knows it is working from a summary and may request earlier details if needed.
 
 Existing summary:
 %s

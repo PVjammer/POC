@@ -20,12 +20,16 @@ import (
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
-const maxRounds = 15
+const maxRounds = 25
 
 const baseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
 Help the user accomplish tasks using shell commands and your own knowledge.
 Be concise. Show relevant output. Prefer doing over explaining.
 Use tools when needed; answer directly when you can.
+
+Before your first tool call, state in one sentence what you are looking for and which
+tool reaches it most directly. Once you have relevant results, synthesize your answer —
+don't keep exploring beyond what is needed to answer the question.
 
 When context slots are shown as stubs in the "Active context" section, call
 read_context() to retrieve their full content BEFORE exploring the filesystem.
@@ -112,6 +116,7 @@ type Loop struct {
 	// Compaction state (Phase 4).
 	compactionSummary string // current structured summary; empty = never compacted
 	compactionDepth   int    // number of times compaction has run this session
+	turnStart         int    // index in l.history of the current turn's user message; set by Run()
 
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
@@ -243,6 +248,9 @@ func (l *Loop) newSpinnerOrNop() spinnerIface {
 // Run executes one user turn — potentially many agent rounds.
 // onToken is called with each piece of the final text response.
 func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) error {
+	l.turnStart = len(l.history) // record where this turn's user message will land
+	defer func() { l.turnStart = 0 }()
+
 	l.history = append(l.history, llm.ChatMessage{
 		Role:    "user",
 		Content: userMsg,
@@ -255,6 +263,7 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 
 	type callSig struct{ name, args string }
 	recentCalls := make(map[callSig]int)
+	nudges := 0
 
 	sp := l.newSpinnerOrNop()
 
@@ -358,9 +367,21 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 				Role:    "assistant",
 				Content: final.Text,
 			})
+			return nil
 		}
 
-		return nil
+		// Model returned neither tool calls nor text. Nudge it rather than
+		// silently returning nothing. After two nudges, give up with an error.
+		if nudges >= 2 {
+			sp.stop()
+			return fmt.Errorf("model returned empty response after %d nudge(s); context may be too degraded", nudges)
+		}
+		nudges++
+		l.history = append(l.history, llm.ChatMessage{
+			Role:    "user",
+			Content: "Please provide your final answer based on what you have gathered so far.",
+		})
+		sp = l.newSpinnerOrNop()
 	}
 
 	sp.stop()
@@ -409,6 +430,20 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 				}
 				sys += fmt.Sprintf("\n  stderr: %s", truncated)
 			}
+		}
+	}
+
+	// Goal pinning: repeat the current turn's user message in the system prompt so
+	// the model can't lose track of the task after many tool calls. This places the
+	// goal at the beginning of context (here) AND the end (structurally protected
+	// tail), exploiting the U-shaped attention curve.
+	if l.turnStart > 0 && l.turnStart < len(l.history) {
+		if goal := l.history[l.turnStart]; goal.Role == "user" {
+			content := goal.Content
+			if len(content) > 300 {
+				content = content[:300] + "..."
+			}
+			sys += fmt.Sprintf("\n\nCurrent task: %s", content)
 		}
 	}
 
