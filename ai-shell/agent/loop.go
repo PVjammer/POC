@@ -11,6 +11,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,11 @@ import (
 
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
+
+// ErrMaxRounds is returned when the agent exhausts its round budget. The loop
+// delivers a forced partial response before returning this error so the caller
+// always receives some output. The caller may re-invoke Run to continue.
+var ErrMaxRounds = errors.New("reached max rounds")
 
 const maxRounds = 25
 
@@ -30,6 +36,9 @@ Use tools when needed; answer directly when you can.
 Before your first tool call, state in one sentence what you are looking for and which
 tool reaches it most directly. Once you have relevant results, synthesize your answer —
 don't keep exploring beyond what is needed to answer the question.
+
+For complex multi-step tasks, use task_list to track sub-goals: add tasks at the start,
+mark them done as you complete each one. Skip it for simple lookups.
 
 When context slots are shown as stubs in the "Active context" section, call
 read_context() to retrieve their full content BEFORE exploring the filesystem.
@@ -117,6 +126,11 @@ type Loop struct {
 	compactionSummary string // current structured summary; empty = never compacted
 	compactionDepth   int    // number of times compaction has run this session
 	turnStart         int    // index in l.history of the current turn's user message; set by Run()
+
+	// Per-turn task list. Lives outside history so it is never compacted.
+	// Cleared at the start of each Run() call.
+	taskList   []taskEntry
+	nextTaskID int
 
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
@@ -251,6 +265,10 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 	l.turnStart = len(l.history) // record where this turn's user message will land
 	defer func() { l.turnStart = 0 }()
 
+	// Reset the task list for this invocation — it is ephemeral and per-query.
+	l.taskList = nil
+	l.nextTaskID = 1
+
 	l.history = append(l.history, llm.ChatMessage{
 		Role:    "user",
 		Content: userMsg,
@@ -283,10 +301,11 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 		}
 
 		msgs := l.buildMessages()
+		roundTools := append(l.tools, taskListToolDef())
 		if l.debugLog != nil {
-			logLLMCall(l.debugLog, round, msgs, l.tools)
+			logLLMCall(l.debugLog, round, msgs, roundTools)
 		}
-		ch := l.provider.ChatWithTools(ctx, msgs, l.tools, opts)
+		ch := l.provider.ChatWithTools(ctx, msgs, roundTools, opts)
 
 		// Drain — ChatWithTools emits one final chunk.
 		var final llm.StreamChunk
@@ -385,7 +404,26 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 	}
 
 	sp.stop()
-	return fmt.Errorf("reached max rounds (%d) without a final response", maxRounds)
+
+	// Force a partial response so the user gets something rather than a bare error.
+	l.history = append(l.history, llm.ChatMessage{
+		Role:    "user",
+		Content: "You've reached the tool-call limit for this turn. Based on the work done so far, give your best answer now.",
+	})
+	msgs := l.buildMessages()
+	ch := l.provider.ChatMessages(ctx, msgs, opts)
+	var partial strings.Builder
+	for chunk := range ch {
+		if chunk.Error == nil && chunk.Text != "" {
+			partial.WriteString(chunk.Text)
+			onToken(chunk.Text)
+		}
+	}
+	if s := partial.String(); s != "" {
+		l.history = append(l.history, llm.ChatMessage{Role: "assistant", Content: s})
+	}
+
+	return ErrMaxRounds
 }
 
 // ClearHistory resets conversation context.
@@ -409,12 +447,11 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 		sys = l.systemPrompt
 	}
 
-	// Dynamic tool list.
-	if len(l.tools) > 0 {
-		sys += "\n\nAvailable tools:"
-		for _, t := range l.tools {
-			sys += fmt.Sprintf("\n- %s: %s", t.Name, t.Description)
-		}
+	// Dynamic tool list — external tools plus the internal task_list tool.
+	allTools := append(l.tools, taskListToolDef())
+	sys += "\n\nAvailable tools:"
+	for _, t := range allTools {
+		sys += fmt.Sprintf("\n- %s: %s", t.Name, t.Description)
 	}
 
 	// Shell state.
@@ -445,6 +482,11 @@ func (l *Loop) buildMessages() []llm.ChatMessage {
 			}
 			sys += fmt.Sprintf("\n\nCurrent task: %s", content)
 		}
+	}
+
+	// Task list (if the model has populated it). Lives outside history — never compacted.
+	if len(l.taskList) > 0 {
+		sys += "\n\nTask list:\n" + l.formatTaskList()
 	}
 
 	// Active context slots — small slots injected verbatim, large slots as stubs.
@@ -562,6 +604,11 @@ func (l *Loop) shouldCompact() bool {
 }
 
 func (l *Loop) executeTool(ctx context.Context, tc llm.ToolCall) string {
+	// Internal tools are handled directly against loop state.
+	if tc.Name == "task_list" {
+		return l.handleTaskList(tc.Args)
+	}
+
 	handler, ok := l.handlers[tc.Name]
 	if !ok {
 		return fmt.Sprintf("error: unknown tool %q", tc.Name)

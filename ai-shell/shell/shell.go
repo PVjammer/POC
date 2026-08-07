@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -435,11 +436,37 @@ func (s *Shell) runAgentForeground(msg string, act bool) {
 	defer signal.Stop(sigCh)
 	go func() { <-sigCh; cancel() }()
 
+	onToken := func(token string) { fmt.Print(token) }
+
 	fmt.Println()
-	err := s.activeLoop().Run(ctx, msg, func(token string) { fmt.Print(token) })
+	err := s.activeLoop().Run(ctx, msg, onToken)
 	fmt.Println()
 
-	if err != nil && err != context.Canceled {
+	// When the round limit is hit the loop already delivered a forced partial
+	// response. Ask the user whether to continue; if so, re-enter the loop with
+	// the history intact so the agent picks up where it left off.
+	for errors.Is(err, agent.ErrMaxRounds) {
+		tty, ttyErr := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if ttyErr != nil {
+			break
+		}
+		fmt.Fprintf(tty, "\033[2m[round limit — continue? y/N] \033[0m")
+		sc := bufio.NewScanner(tty)
+		var answer string
+		if sc.Scan() {
+			answer = strings.TrimSpace(strings.ToLower(sc.Text()))
+		}
+		tty.Close()
+		if answer != "y" && answer != "yes" {
+			err = nil
+			break
+		}
+		fmt.Println()
+		err = s.activeLoop().Run(ctx, "Continue from where you left off.", onToken)
+		fmt.Println()
+	}
+
+	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "agent error: %v\n", err)
 	}
 }
