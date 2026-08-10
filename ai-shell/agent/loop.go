@@ -28,7 +28,9 @@ var ErrMaxRounds = errors.New("reached max rounds")
 
 const maxRounds = 25
 
-const baseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
+// BaseSystemPrompt is the default system prompt for the agentic (!) mode.
+// Exported so shell packages can use it when composing additional_instructions.
+const BaseSystemPrompt = `You are an AI shell assistant running inside a Unix terminal.
 Help the user accomplish tasks using shell commands and your own knowledge.
 Be concise. Show relevant output. Prefer doing over explaining.
 Use tools when needed; answer directly when you can.
@@ -84,6 +86,7 @@ type LoopConfig struct {
 	CompactionTailMessages int     // messages always kept verbatim in the protected tail (default 20)
 
 	MaxResponseTokens int // max tokens the model may generate per turn (default 16384)
+	MaxRounds         int // cap on tool-call rounds per Run() call (default 25)
 }
 
 func defaultLoopConfig() LoopConfig {
@@ -120,7 +123,7 @@ type Loop struct {
 	contextSlots   map[string]CtxSlot
 	cfg            LoopConfig
 	spinnerEnabled bool
-	systemPrompt   string // empty = use baseSystemPrompt
+	systemPrompt   string // empty = use BaseSystemPrompt
 
 	// Compaction state (Phase 4).
 	compactionSummary string // current structured summary; empty = never compacted
@@ -131,6 +134,21 @@ type Loop struct {
 	// Cleared at the start of each Run() call.
 	taskList   []taskEntry
 	nextTaskID int
+
+	// Skill catalog and loader — set by the shell via SetSkillCatalog.
+	// skillCatalog is pre-filtered for this agent's skill allowlist.
+	// skillLoader satisfies skills.SkillLoader without importing the skills package.
+	skillCatalog []SkillCatalogEntry
+	skillLoader  interface {
+		Body(name string) (string, error)
+	}
+
+	// Session querier — set by the shell when sessions are merged via /session merge.
+	// Enables the query_session tool; nil = tool not available.
+	sessionQuerier interface {
+		QuerySession(ctx context.Context, name, question string) (string, error)
+	}
+	queryableSessions []string // session names available via query_session
 
 	// Callbacks for the shell to display tool activity.
 	OnToolCall   func(name string, args map[string]interface{})
@@ -165,6 +183,9 @@ func (l *Loop) SetContextSlots(slots map[string]CtxSlot) { l.contextSlots = slot
 // ToolDefs returns the current tool definitions (used by the describe_tool handler).
 func (l *Loop) ToolDefs() []llm.ToolDef { return l.tools }
 
+// GetConfig returns the current loop configuration.
+func (l *Loop) GetConfig() LoopConfig { return l.cfg }
+
 // SetConfig updates tuneable loop parameters.
 func (l *Loop) SetConfig(cfg LoopConfig) {
 	if cfg.MaxHistoryMessages > 0 {
@@ -193,6 +214,9 @@ func (l *Loop) SetConfig(cfg LoopConfig) {
 	}
 	if cfg.MaxResponseTokens > 0 {
 		l.cfg.MaxResponseTokens = cfg.MaxResponseTokens
+	}
+	if cfg.MaxRounds > 0 {
+		l.cfg.MaxRounds = cfg.MaxRounds
 	}
 }
 
@@ -244,6 +268,30 @@ func (l *Loop) RunOneShot(ctx context.Context, systemPrompt, userMsg string, onT
 	return nil
 }
 
+// SkillCatalogEntry is a minimal view of a skill for system prompt injection.
+type SkillCatalogEntry struct {
+	Name                   string
+	Description            string
+	DisableModelInvocation bool
+}
+
+// SetSkillCatalog wires the skill catalog and loader into the loop.
+// catalog should already be filtered for this agent's skill allowlist.
+// Pass nil loader to disable skill support.
+func (l *Loop) SetSkillCatalog(catalog []SkillCatalogEntry, loader interface{ Body(string) (string, error) }) {
+	l.skillCatalog = catalog
+	l.skillLoader = loader
+}
+
+// SetSessionQuerier wires a session querier into the loop so the agent can call
+// query_session() on sessions merged via /session merge. Pass nil to disable.
+func (l *Loop) SetSessionQuerier(q interface {
+	QuerySession(ctx context.Context, name, question string) (string, error)
+}, sessions []string) {
+	l.sessionQuerier = q
+	l.queryableSessions = sessions
+}
+
 // SetSpinnerEnabled controls whether a spinner is shown during LLM waits.
 // Disable for background execution to avoid corrupting the foreground terminal.
 func (l *Loop) SetSpinnerEnabled(v bool) { l.spinnerEnabled = v }
@@ -285,7 +333,11 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 
 	sp := l.newSpinnerOrNop()
 
-	for round := 0; round < maxRounds; round++ {
+	rounds := maxRounds
+	if l.cfg.MaxRounds > 0 {
+		rounds = l.cfg.MaxRounds
+	}
+	for round := 0; round < rounds; round++ {
 		if ctx.Err() != nil {
 			sp.stop()
 			return ctx.Err()
@@ -302,6 +354,12 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 
 		msgs := l.buildMessages()
 		roundTools := append(l.tools, taskListToolDef())
+		if l.skillLoader != nil {
+			roundTools = append(roundTools, useSkillToolDef())
+		}
+		if l.sessionQuerier != nil {
+			roundTools = append(roundTools, querySessionToolDef())
+		}
 		if l.debugLog != nil {
 			logLLMCall(l.debugLog, round, msgs, roundTools)
 		}
@@ -442,16 +500,41 @@ func (l *Loop) ToolNames() []string {
 }
 
 func (l *Loop) buildMessages() []llm.ChatMessage {
-	sys := baseSystemPrompt
+	sys := BaseSystemPrompt
 	if l.systemPrompt != "" {
 		sys = l.systemPrompt
 	}
 
-	// Dynamic tool list — external tools plus the internal task_list tool.
-	allTools := append(l.tools, taskListToolDef())
+	// Dynamic tool list — external tools plus internal tools.
+	internalTools := []llm.ToolDef{taskListToolDef()}
+	if l.skillLoader != nil {
+		internalTools = append(internalTools, useSkillToolDef())
+	}
+	if l.sessionQuerier != nil {
+		internalTools = append(internalTools, querySessionToolDef())
+	}
+	allTools := append(l.tools, internalTools...)
 	sys += "\n\nAvailable tools:"
 	for _, t := range allTools {
 		sys += fmt.Sprintf("\n- %s: %s", t.Name, t.Description)
+	}
+
+	// Skill catalog — injected after tools so the model knows what skills exist.
+	if len(l.skillCatalog) > 0 {
+		sys += "\n\nAvailable skills (call use_skill to load full instructions):"
+		for _, sk := range l.skillCatalog {
+			if !sk.DisableModelInvocation {
+				sys += fmt.Sprintf("\n- %s: %s", sk.Name, sk.Description)
+			}
+		}
+	}
+
+	// Queryable sessions — injected when sessions have been merged.
+	if len(l.queryableSessions) > 0 {
+		sys += "\n\nMerged sessions (queryable via query_session):"
+		for _, name := range l.queryableSessions {
+			sys += fmt.Sprintf("\n- %s", name)
+		}
 	}
 
 	// Shell state.
@@ -607,6 +690,12 @@ func (l *Loop) executeTool(ctx context.Context, tc llm.ToolCall) string {
 	// Internal tools are handled directly against loop state.
 	if tc.Name == "task_list" {
 		return l.handleTaskList(tc.Args)
+	}
+	if tc.Name == "use_skill" {
+		return l.handleUseSkill(tc.Args)
+	}
+	if tc.Name == "query_session" {
+		return l.handleQuerySession(ctx, tc.Args)
 	}
 
 	handler, ok := l.handlers[tc.Name]

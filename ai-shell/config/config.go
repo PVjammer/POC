@@ -43,6 +43,7 @@ type Config struct {
 	CompactionThreshold    float64 `toml:"compaction_threshold"`     // fire LLM compaction at this fraction of ceiling
 	CompactionTailMessages int     `toml:"compaction_tail_messages"` // messages always kept verbatim in tail
 	MaxResponseTokens      int     `toml:"max_response_tokens"`      // max tokens the model may generate per turn
+	MaxRounds              int     `toml:"max_rounds"`               // cap on tool-call rounds per Run() call
 
 	Notifications bool `toml:"notifications"` // send desktop notification when a background job completes
 }
@@ -59,6 +60,7 @@ func Defaults() Config {
 		CompactionThreshold:    0.75,
 		CompactionTailMessages: 20,
 		MaxResponseTokens:      16384,
+		MaxRounds:              25,
 		Prompt: PromptConfig{
 			PathMaxDepth:  3,
 			ShowGitBranch: true,
@@ -151,6 +153,34 @@ func Load() (Config, error) {
 
 	applyPromptDefaults(&cfg.Prompt)
 	return cfg, nil
+}
+
+// DefaultTOML returns a commented TOML template showing all config keys and their defaults.
+// Used when /config edit creates the file for the first time.
+func DefaultTOML() string {
+	return `# baish configuration — ~/.config/baish/config.toml
+# All values shown are defaults. Uncomment and change to override.
+
+# max_history_messages   = 20      # conversation turns kept in context
+# tool_output_max_chars  = 4000    # truncate tool results above this
+# tool_output_overflow   = "truncate"  # "truncate" or "summarize"
+# ctx_inline_threshold   = 4096    # bytes; larger ctx slots shown as stubs
+# tool_output_keep_rounds = 3      # rounds of tool output kept verbatim
+# max_context_tokens     = 32768   # model context ceiling in tokens
+# compaction_threshold   = 0.75    # fire LLM compaction at this fraction
+# compaction_tail_messages = 20    # messages always kept in the tail
+# max_response_tokens    = 16384   # max tokens the model may generate
+# max_rounds             = 25      # cap on tool-call rounds per run
+# notifications          = false   # desktop notification on job complete
+
+[prompt]
+# path_max_depth  = 3        # path segments shown; 0 = full path
+# show_git_branch = true
+# path_color      = "green"  # red green yellow blue magenta cyan white bold dim none
+# branch_color    = "magenta"
+# job_color       = "yellow"
+# suffix          = " $ "
+`
 }
 
 // Save writes the config to disk.

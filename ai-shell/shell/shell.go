@@ -24,6 +24,7 @@ import (
 	"github.com/pvjammer/ai-shell-poc/config"
 	"github.com/pvjammer/ai-shell-poc/functions"
 	"github.com/pvjammer/ai-shell-poc/permissions"
+	"github.com/pvjammer/ai-shell-poc/skills"
 	"github.com/pvjammer/ai-shell-poc/tools"
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
@@ -69,6 +70,18 @@ type Shell struct {
 	withCtxs map[string]*withContext // active /with capture buffers, keyed by mode name
 
 	ocClient *backend.OpenCodeClient // non-nil when OpenCode backend is configured
+
+	// Dynamic configuration — skills, agents, commands.
+	skillLoader     *skills.Loader
+	agentRegistry   map[string]config.AgentConfig
+	commandRegistry []config.CommandConfig
+	activeAgentName string               // "default" unless switched via /agent
+	dynCfg          *config.DynamicConfig
+	dynCfgCtxCancel context.CancelFunc
+
+	// Queryable sessions — populated by /session merge.
+	// Maps session name → LLM-generated summary of the merged session.
+	queryableSessions map[string]string
 }
 
 // New creates and wires up the shell.
@@ -114,16 +127,20 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	}
 
 	s := &Shell{
-		cfg:           cfg,
-		appCfg:        appCfg,
-		rl:            rl,
-		fnLoader:      fnLoader,
-		jobs:          newJobManager(),
-		actTools:      allTools,
-		actHandlers:   baseHandlers,
-		sessions:      make(map[string]*sessionEntry),
-		activeSession: "main",
-		withCtxs:      make(map[string]*withContext),
+		cfg:             cfg,
+		appCfg:          appCfg,
+		rl:              rl,
+		fnLoader:        fnLoader,
+		jobs:            newJobManager(),
+		actTools:        allTools,
+		actHandlers:     baseHandlers,
+		sessions:        make(map[string]*sessionEntry),
+		activeSession:   "main",
+		withCtxs:        make(map[string]*withContext),
+		skillLoader:     skills.NewLoader(),
+		agentRegistry:   make(map[string]config.AgentConfig),
+		commandRegistry: nil,
+		activeAgentName: "default",
 	}
 	s.jobs.onComplete = s.maybeNotify
 
@@ -171,7 +188,203 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 		}
 	}
 
+	// Initialize dynamic configuration: skills, agents, commands.
+	s.initDynamic()
+
 	return s, nil
+}
+
+// initDynamic loads skills, agents, and commands, then starts the file watcher.
+// Called once from New(); safe to call again to force a full reload.
+func (s *Shell) initDynamic() {
+	stderr := s.rl.Stderr()
+
+	// Skills.
+	skillPaths := skillScanPaths()
+	if errs := s.skillLoader.Scan(skillPaths); len(errs) > 0 {
+		for _, e := range errs {
+			fmt.Fprintf(stderr, "\033[2m[skills] %v\033[0m\n", e)
+		}
+	}
+
+	// Agents.
+	agentDirs := agentConfigDirs()
+	registry, warnings, err := config.LoadAgentFiles(agentDirs...)
+	if err != nil {
+		fmt.Fprintf(stderr, "\033[33m[agents] load error: %v\033[0m\n", err)
+	}
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "\033[33m[agents] %s\033[0m\n", w)
+	}
+	s.agentRegistry = registry
+
+	// Commands.
+	cmdDirs := commandConfigPaths()
+	cmds, warnings, err := config.LoadCommandFiles(cmdDirs...)
+	if err != nil {
+		fmt.Fprintf(stderr, "\033[33m[commands] load error: %v\033[0m\n", err)
+	}
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "\033[33m[commands] %s\033[0m\n", w)
+	}
+	s.commandRegistry = cmds
+	s.validateCommandRefs()
+
+	// Wire skill catalog into the active session's loop.
+	s.syncSkillCatalog(s.currentSession())
+
+	// File watcher.
+	if s.dynCfgCtxCancel != nil {
+		s.dynCfgCtxCancel() // stop any previous watcher
+	}
+	watchPaths := append(skillPaths, agentDirs...)
+	watchPaths = append(watchPaths, cmdDirs...)
+	watchPaths = append(watchPaths,
+		config.AgentsFile(),
+		config.CommandsFile(),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.dynCfgCtxCancel = cancel
+	if w, err := config.NewDynamicConfig(watchPaths, s.onConfigChange); err == nil {
+		s.dynCfg = w
+		s.dynCfg.Start(ctx)
+	}
+}
+
+// onConfigChange is called by the file watcher after a debounce. It re-parses
+// whichever config changed and updates the in-memory registries.
+func (s *Shell) onConfigChange(path string) {
+	stderr := s.rl.Stderr()
+
+	// Re-scan everything for simplicity; the debounce ensures this isn't hot.
+	if errs := s.skillLoader.Scan(skillScanPaths()); len(errs) > 0 {
+		for _, e := range errs {
+			fmt.Fprintf(stderr, "\033[2m[skills] %v\033[0m\n", e)
+		}
+	}
+
+	registry, warnings, _ := config.LoadAgentFiles(agentConfigDirs()...)
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "\033[33m[agents] %s\033[0m\n", w)
+	}
+	s.agentRegistry = registry
+
+	cmds, warnings, _ := config.LoadCommandFiles(commandConfigPaths()...)
+	for _, w := range warnings {
+		fmt.Fprintf(stderr, "\033[33m[commands] %s\033[0m\n", w)
+	}
+	s.commandRegistry = cmds
+	s.validateCommandRefs()
+
+	s.syncSkillCatalog(s.currentSession())
+	fmt.Fprintf(stderr, "\033[2m[config] reloaded: %s\033[0m\n", filepath.Base(path))
+}
+
+// syncSkillCatalog pushes the current agent's skill list into the session's loop.
+func (s *Shell) syncSkillCatalog(sess *sessionEntry) {
+	recs := s.effectiveSkillList(s.activeAgentName)
+	catalog := make([]agent.SkillCatalogEntry, len(recs))
+	for i, r := range recs {
+		catalog[i] = agent.SkillCatalogEntry{
+			Name:                   r.Name,
+			Description:            r.Description,
+			DisableModelInvocation: r.DisableModelInvocation,
+		}
+	}
+	sess.loop.SetSkillCatalog(catalog, s.skillLoader)
+}
+
+// effectiveSkillList returns the skills available for the named agent.
+// "default": all installed skills minus ExcludedSkills.
+// named agent with Skills set: only those skills.
+// named agent with Skills nil: no skills (opt-in required).
+func (s *Shell) effectiveSkillList(agentName string) []skills.Record {
+	all := s.skillLoader.All()
+
+	if agentName == "default" {
+		cfg := s.agentRegistry["default"] // zero value is fine
+		if len(cfg.ExcludedSkills) == 0 {
+			return all
+		}
+		excluded := make(map[string]bool, len(cfg.ExcludedSkills))
+		for _, n := range cfg.ExcludedSkills {
+			excluded[n] = true
+		}
+		out := all[:0:len(all)]
+		for _, r := range all {
+			if !excluded[r.Name] {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	cfg, ok := s.agentRegistry[agentName]
+	if !ok || len(cfg.Skills) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(cfg.Skills))
+	for _, n := range cfg.Skills {
+		allowed[n] = true
+	}
+	var out []skills.Record
+	for _, r := range all {
+		if allowed[r.Name] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// validateCommandRefs checks that every command's agent and skill references
+// exist in the registries and prints warnings for broken ones.
+func (s *Shell) validateCommandRefs() {
+	stderr := s.rl.Stderr()
+	for _, cmd := range s.commandRegistry {
+		if cmd.Agent != "" && cmd.Agent != "default" && cmd.Agent != "one_shot" {
+			if _, ok := s.agentRegistry[cmd.Agent]; !ok {
+				fmt.Fprintf(stderr, "\033[33m[commands] warning: command %q references unknown agent %q\033[0m\n", cmd.Name, cmd.Agent)
+			}
+		}
+		if cmd.Skill != "" {
+			if _, ok := s.skillLoader.Get(cmd.Skill); !ok {
+				fmt.Fprintf(stderr, "\033[33m[commands] warning: command %q references unknown skill %q\033[0m\n", cmd.Name, cmd.Skill)
+			}
+		}
+	}
+}
+
+// skillScanPaths returns the ordered list of directories to scan for skills.
+// Higher-priority paths come last (last write wins on name collision).
+func skillScanPaths() []string {
+	home, _ := os.UserHomeDir()
+	return []string{
+		filepath.Join(home, ".config", "baish", "skills"),
+		filepath.Join(".baish", "skills"),
+		// cross-harness compat paths (read-only; lower priority)
+		filepath.Join(home, ".agents", "skills"),
+		filepath.Join(".agents", "skills"),
+		filepath.Join(".claude", "skills"),
+	}
+}
+
+// agentConfigDirs returns the directories containing agent *.toml files.
+func agentConfigDirs() []string {
+	return []string{
+		config.AgentsDir(),
+		filepath.Join(".baish", "agents"),
+	}
+}
+
+// commandConfigPaths returns the files and directories to load commands from.
+// Includes both the single-file commands.toml and the commands/ directory.
+func commandConfigPaths() []string {
+	return []string{
+		config.CommandsFile(),    // ~/.config/baish/commands.toml
+		config.CommandsDir(),     // ~/.config/baish/commands/
+		filepath.Join(".baish", "commands.toml"),
+		filepath.Join(".baish", "commands"),
+	}
 }
 
 // Run starts the interactive loop and blocks until the user exits.
@@ -812,6 +1025,12 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 		case "permissions", "perm":
 			s.runPermissions(nil)
 			return false
+		case "agent":
+			s.runAgentCmd([]string{"--help"})
+			return false
+		case "skill":
+			s.runSkillCmd([]string{"--help"})
+			return false
 		case "model":
 			if s.ocClient != nil {
 				fmt.Printf("usage: /model <name> [endpoint]\nbackend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
@@ -832,6 +1051,14 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 				s.printWithHelp()
 				return false
 			}
+		}
+	}
+
+	// Custom commands from commandRegistry take priority over built-ins (except AI functions).
+	for _, cmd := range s.commandRegistry {
+		if cmd.Name == name {
+			s.runCustomCommand(cmd, args, "")
+			return false
 		}
 	}
 
@@ -892,6 +1119,25 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 
 	case "with":
 		s.runWith(args)
+
+	case "agent":
+		s.runAgentCmd(args)
+
+	case "skill":
+		s.runSkillCmd(args)
+
+	case "commands", "cmds":
+		// /commands edit  →  open commands.toml in $EDITOR
+		path := config.CommandsFile()
+		if err := ensureFile(path, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "commands: %v\n", err)
+			return false
+		}
+		if err := openInEditor(path); err != nil {
+			fmt.Fprintf(os.Stderr, "commands: editor: %v\n", err)
+		} else {
+			s.onConfigChange(path)
+		}
 
 	case "exit", "quit", "q":
 		return true
@@ -1054,6 +1300,7 @@ func (s *Shell) runConfig(args []string) {
 		fmt.Printf("  %-30s %v\n", "compaction_threshold", s.appCfg.CompactionThreshold)
 		fmt.Printf("  %-30s %v\n", "compaction_tail_messages", s.appCfg.CompactionTailMessages)
 		fmt.Printf("  %-30s %v\n", "max_response_tokens", s.appCfg.MaxResponseTokens)
+		fmt.Printf("  %-30s %v\n", "max_rounds", s.appCfg.MaxRounds)
 		fmt.Printf("  %-30s %v\n", "notifications", s.appCfg.Notifications)
 		fmt.Println()
 		fmt.Printf("  %-30s %v\n", "prompt.path_max_depth", p.PathMaxDepth)
@@ -1146,6 +1393,13 @@ func (s *Shell) runConfig(args []string) {
 				return
 			}
 			s.appCfg.MaxResponseTokens = n
+		case "max_rounds":
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 1 {
+				fmt.Fprintln(os.Stderr, "config: max_rounds must be an integer >= 1")
+				return
+			}
+			s.appCfg.MaxRounds = n
 		case "notifications":
 			switch val {
 			case "true", "1", "yes":
@@ -1211,9 +1465,59 @@ func (s *Shell) runConfig(args []string) {
 			fmt.Println("config: reset to defaults")
 		}
 
+	case "edit":
+		path := config.Path()
+		if err := ensureFile(path, config.DefaultTOML()); err != nil {
+			fmt.Fprintf(os.Stderr, "config: %v\n", err)
+			return
+		}
+		if err := openInEditor(path); err != nil {
+			fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		}
+
+	case "commands", "cmds":
+		// /config commands edit  or just  /commands edit
+		path := config.CommandsFile()
+		if err := ensureFile(path, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "config: %v\n", err)
+			return
+		}
+		if err := openInEditor(path); err != nil {
+			fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "config: unknown subcommand %q\n", args[0])
 	}
+}
+
+// openInEditor opens path in $EDITOR (falling back to vi) and waits for exit.
+// The terminal is restored to its normal state while the editor runs.
+func openInEditor(path string) error {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+	cmd := exec.Command(editor, path)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// ensureFile creates the file (and parent dirs) if it doesn't exist, writing
+// defaultContent as the initial content.
+func ensureFile(path, defaultContent string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return os.WriteFile(path, []byte(defaultContent), 0644)
+	}
+	return nil
 }
 
 func (s *Shell) printHelp() {
@@ -1237,6 +1541,23 @@ func (s *Shell) printHelp() {
 	fmt.Println("AI functions (slash commands):")
 	for _, name := range s.fnLoader.Names() {
 		fmt.Println(formatEntry("/"+name, s.fnLoader.Describe(name)))
+	}
+	if len(s.commandRegistry) > 0 {
+		fmt.Println()
+		fmt.Println("Custom commands:")
+		for _, cmd := range s.commandRegistry {
+			agent := cmd.Agent
+			if agent == "" {
+				agent = "default"
+			}
+			desc := cmd.Description
+			if desc == "" {
+				desc = fmt.Sprintf("[%s]", agent)
+			} else {
+				desc = fmt.Sprintf("%s [%s]", desc, agent)
+			}
+			fmt.Println(formatEntry("/"+cmd.Name, desc))
+		}
 	}
 	fmt.Println()
 	fmt.Println("Built-in commands:")
@@ -1331,6 +1652,39 @@ func (s *Shell) applyRight(ctx context.Context, content string, right *ParsedInp
 		if parts[0] == "ctx" {
 			s.runCtx(parts[1:], content)
 			return
+		}
+		if parts[0] == "agent" {
+			// cat file | /agent <name> <query>
+			// Always a one-off run when piped; never a persistent switch.
+			// <query> is required when piping so the agent knows what to do with the content.
+			if len(parts) < 3 {
+				fmt.Fprintln(os.Stderr, "agent: piped usage requires a query: cat file | /agent <name> <query>")
+				fmt.Fprintln(os.Stderr, "  example: cat README.md | /agent concise \"summarize this\"")
+				return
+			}
+			agentName := parts[1]
+			query := strings.TrimSpace(strings.Join(parts[2:], " "))
+
+			cfg, ok := s.agentRegistry[agentName]
+			if !ok && agentName != "default" && agentName != "one_shot" {
+				fmt.Fprintf(os.Stderr, "agent: unknown agent %q (try /agent to list)\n", agentName)
+				return
+			}
+
+			msg := strings.TrimSpace(content) + "\n\n" + query
+			if agentName == "one_shot" {
+				s.runCommandOneShot(msg, "", firstNonEmpty(cfg.Model, s.cfg.Model), firstNonEmpty(cfg.Endpoint, s.cfg.Endpoint))
+			} else {
+				s.runAgentOneOff(agentName, cfg, msg)
+			}
+			return
+		}
+		// Custom commands defined in commandRegistry.
+		for _, cmd := range s.commandRegistry {
+			if cmd.Name == parts[0] {
+				s.runCustomCommand(cmd, parts[1:], content)
+				return
+			}
 		}
 		result, err := s.fnLoader.ExecuteWithStdin(ctx, parts[0], content, parts[1:])
 		if err != nil {
@@ -1510,6 +1864,7 @@ func (s *Shell) syncAgentContext() {
 		CompactionThreshold:    s.appCfg.CompactionThreshold,
 		CompactionTailMessages: s.appCfg.CompactionTailMessages,
 		MaxResponseTokens:      s.appCfg.MaxResponseTokens,
+		MaxRounds:              s.appCfg.MaxRounds,
 	})
 }
 
@@ -2140,7 +2495,7 @@ func wordWrap(text string, width int) []string {
 }
 
 func metaCommands() []string {
-	cmds := []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "cm", "with", "exit"}
+	cmds := []string{"help", "tools", "clear", "ctx", "config", "jobs", "job", "permissions", "model", "history", "commit-msg", "cm", "with", "agent", "skill", "commands", "exit"}
 	for name := range withModes {
 		cmds = append(cmds, name)
 	}
@@ -2190,21 +2545,43 @@ func (s *Shell) buildOCSystemPrefix() string {
 	return b.String()
 }
 
-func (s *Shell) saveMainSession() {
-	sess, ok := s.sessions["main"]
+func (s *Shell) saveMainSession() { _ = s.saveSession("main") }
+
+// QuerySession answers a question using the named session's conversation history.
+// It implements the SessionQuerier interface consumed by agent.Loop.
+// The session must have been registered via /session merge.
+func (s *Shell) QuerySession(ctx context.Context, name, question string) (string, error) {
+	if _, ok := s.queryableSessions[name]; !ok {
+		return "", fmt.Errorf("session %q has not been merged into this session; use /session merge %s first", name, name)
+	}
+	sess, ok := s.sessions[name]
 	if !ok {
-		return
+		return "", fmt.Errorf("session %q is not in memory (it may have been deleted)", name)
 	}
+
+	sess.mu.Lock()
 	hist := sess.loop.CopyHistory()
+	sess.mu.Unlock()
+
 	if len(hist) == 0 {
-		return
+		return "the session has no conversation history", nil
 	}
-	data, err := json.Marshal(hist)
+
+	provider, err := llm.NewOllamaProvider(s.cfg.Endpoint, s.cfg.Model)
 	if err != nil {
-		return
+		return "", fmt.Errorf("create provider: %w", err)
 	}
-	if err := os.MkdirAll(config.SessionsDir(), 0755); err != nil {
-		return
+
+	sysMsg := "You are answering a question about a prior conversation. Refer only to what appears in the conversation history provided. Be concise and direct."
+	msgs := []llm.ChatMessage{{Role: "system", Content: sysMsg}}
+	msgs = append(msgs, hist...)
+	msgs = append(msgs, llm.ChatMessage{Role: "user", Content: question})
+
+	opts := llm.DefaultOptions().WithMaxTokens(1024).WithTemperature(0.2)
+	ch := provider.ChatMessages(ctx, msgs, opts)
+	resp, err := llm.CollectResponse(ctx, ch)
+	if err != nil {
+		return "", fmt.Errorf("llm: %w", err)
 	}
-	_ = os.WriteFile(config.SessionPath("main"), data, 0644)
+	return resp.Text, nil
 }

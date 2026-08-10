@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pvjammer/ai-shell-poc/agent"
+	"github.com/pvjammer/ai-shell-poc/config"
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
@@ -154,6 +156,7 @@ func (s *Shell) createSession(name, parent string, hist []llm.ChatMessage, ctxCo
 	}
 	s.sessions[name] = sess
 	sess.loop.SetTools(s.actTools, s.makeSessionHandlers(sess))
+	s.syncSkillCatalog(sess)
 	return sess, nil
 }
 
@@ -181,6 +184,7 @@ func (s *Shell) runSession(args []string) {
 		fmt.Println("  /session new <name>       create a new blank session")
 		fmt.Println("  /session fork <name>      fork current session into <name>")
 		fmt.Println("  /session switch <name>    switch to session <name>")
+		fmt.Println("  /session merge [name] [--edit]  merge a fork into current: injects overview, makes it queryable")
 		fmt.Println("  /session show [name]      show session details")
 		fmt.Println("  /session export <name>    export session history")
 		fmt.Println("  /session delete <name>    delete a session")
@@ -204,6 +208,19 @@ func (s *Shell) runSession(args []string) {
 		}
 		if err := s.sessionFork(rest[0]); err != nil {
 			fmt.Fprintf(os.Stderr, "session fork: %v\n", err)
+		}
+	case "merge":
+		name := ""
+		edit := false
+		for _, a := range rest {
+			if a == "--edit" || a == "-e" {
+				edit = true
+			} else if name == "" {
+				name = a
+			}
+		}
+		if err := s.doMerge(name, edit); err != nil {
+			fmt.Fprintf(os.Stderr, "session merge: %v\n", err)
 		}
 	case "switch", "sw":
 		if len(rest) == 0 {
@@ -240,7 +257,7 @@ func (s *Shell) runSession(args []string) {
 			fmt.Fprintf(os.Stderr, "session delete: %v\n", err)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown session subcommand %q\n  subcommands: list new fork switch show export delete\n", sub)
+		fmt.Fprintf(os.Stderr, "unknown session subcommand %q\n  subcommands: list new fork merge switch show export delete\n", sub)
 	}
 }
 
@@ -372,4 +389,246 @@ func truncate80(s string) string {
 		return s
 	}
 	return s[:80] + "…"
+}
+
+// saveSession persists any named session's history to disk.
+func (s *Shell) saveSession(name string) error {
+	sess, ok := s.sessions[name]
+	if !ok {
+		return fmt.Errorf("no session %q", name)
+	}
+	hist := sess.loop.CopyHistory()
+	if len(hist) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(hist)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if err := os.MkdirAll(config.SessionsDir(), 0755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	return os.WriteFile(config.SessionPath(name), data, 0644)
+}
+
+// syncSessionQuerier wires the shell's QuerySession implementation into the
+// given session's loop so query_session tool calls resolve correctly.
+func (s *Shell) syncSessionQuerier(sess *sessionEntry) {
+	if len(s.queryableSessions) == 0 {
+		return
+	}
+	names := make([]string, 0, len(s.queryableSessions))
+	for name := range s.queryableSessions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	sess.loop.SetSessionQuerier(s, names)
+}
+
+// resolveMergeSource returns the session name to merge when none is specified.
+// It looks for sessions forked from the current session; errors if zero or ambiguous.
+func (s *Shell) resolveMergeSource() (string, error) {
+	var forks []string
+	for name, sess := range s.sessions {
+		if sess.parent == s.activeSession {
+			forks = append(forks, name)
+		}
+	}
+	switch len(forks) {
+	case 0:
+		return "", fmt.Errorf("no forked sessions to merge (try /session fork <name> first, or specify: /session merge <name>)")
+	case 1:
+		return forks[0], nil
+	default:
+		sort.Strings(forks)
+		return "", fmt.Errorf("multiple forks of %q — specify one: /session merge <%s>", s.activeSession, strings.Join(forks, "|"))
+	}
+}
+
+// doMerge merges srcName into the current session:
+//  1. Summarises the source session's delta (post-fork messages, or all messages).
+//  2. If edit is true, opens the summary in $EDITOR before injecting.
+//  3. Registers the session as queryable via query_session.
+//  4. Injects the summary as context into the current session.
+func (s *Shell) doMerge(srcName string, edit bool) error {
+	if srcName == "" {
+		var err error
+		srcName, err = s.resolveMergeSource()
+		if err != nil {
+			return err
+		}
+	}
+	src, ok := s.sessions[srcName]
+	if !ok {
+		return fmt.Errorf("no session %q (try /session list)", srcName)
+	}
+	if srcName == s.activeSession {
+		return fmt.Errorf("cannot merge the active session into itself")
+	}
+
+	// Snapshot source (one lock at a time — no deadlock risk with background jobs).
+	src.mu.Lock()
+	srcHist := src.loop.CopyHistory()
+	forkIdx := src.forkIdx
+	srcParent := src.parent
+	src.mu.Unlock()
+
+	// Compute the delta: post-fork messages if forked from current, else all messages.
+	isFork := srcParent == s.activeSession
+	var delta []llm.ChatMessage
+	if isFork {
+		if forkIdx > len(srcHist) {
+			fmt.Printf("  note: source was compacted since fork; merging all remaining messages\n")
+			forkIdx = 0
+		}
+		delta = srcHist[forkIdx:]
+	} else {
+		delta = srcHist
+	}
+
+	if len(delta) == 0 {
+		fmt.Printf("nothing to merge: %q has no new messages\n", srcName)
+		return nil
+	}
+
+	// Summarise the delta.
+	fmt.Printf("summarizing %q (%d messages)...\n", srcName, len(delta))
+	provider, err := llm.NewOllamaProvider(s.cfg.Endpoint, s.cfg.Model)
+	if err != nil {
+		return fmt.Errorf("create provider: %w", err)
+	}
+	summaryMsgs := buildSummaryMessages(delta, srcName)
+	ctx := context.Background()
+	opts := llm.DefaultOptions().WithMaxTokens(512).WithTemperature(0.2)
+	ch := provider.ChatMessages(ctx, summaryMsgs, opts)
+	resp, err := llm.CollectResponse(ctx, ch)
+	if err != nil {
+		return fmt.Errorf("summarize: %w", err)
+	}
+	summary, queryWhen := parseSummaryResponse(resp.Text)
+
+	// Optional: open summary in $EDITOR so the user can refine it before injection.
+	if edit {
+		tmp, err := os.CreateTemp("", "baish-merge-*.md")
+		if err != nil {
+			return fmt.Errorf("create temp file: %w", err)
+		}
+		tmpPath := tmp.Name()
+		defer os.Remove(tmpPath)
+
+		content := fmt.Sprintf("Summary: %s\nQuery when: %s\n", summary, queryWhen)
+		if _, err := tmp.WriteString(content); err != nil {
+			tmp.Close()
+			return fmt.Errorf("write temp file: %w", err)
+		}
+		tmp.Close()
+
+		if err := openInEditor(tmpPath); err != nil {
+			return fmt.Errorf("editor: %w", err)
+		}
+
+		data, err := os.ReadFile(tmpPath)
+		if err != nil {
+			return fmt.Errorf("read temp file: %w", err)
+		}
+		summary, queryWhen = parseSummaryResponse(string(data))
+		if summary == "" {
+			return fmt.Errorf("summary is empty after editing — merge cancelled")
+		}
+	}
+
+	// Register session as queryable (store full text for potential future use).
+	if s.queryableSessions == nil {
+		s.queryableSessions = make(map[string]string)
+	}
+	s.queryableSessions[srcName] = summary
+
+	// Inject overview + query hint into current session history.
+	var mergeNote strings.Builder
+	fmt.Fprintf(&mergeNote, "[session merge: %q]\n\n%s", srcName, summary)
+	if queryWhen != "" {
+		fmt.Fprintf(&mergeNote, "\n\nQuery this session when: %s", queryWhen)
+	}
+	fmt.Fprintf(&mergeNote, "\n\nCall query_session(%q, \"your question\") to retrieve specific details.", srcName)
+
+	dst := s.currentSession()
+	dst.mu.Lock()
+	dstHist := dst.loop.CopyHistory()
+	dstHist = append(dstHist, llm.ChatMessage{
+		Role:    "user",
+		Content: mergeNote.String(),
+	})
+	dstHist = append(dstHist, llm.ChatMessage{
+		Role:    "assistant",
+		Content: fmt.Sprintf("Understood. I have the overview of session %q and will query it when relevant.", srcName),
+	})
+	dst.loop.SetHistory(dstHist)
+	dst.mu.Unlock()
+
+	// Wire query_session tool into the current session's loop.
+	s.syncSessionQuerier(dst)
+
+	// Persist the source session so it survives a restart.
+	if err := s.saveSession(srcName); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not persist %q: %v\n", srcName, err)
+	}
+
+	// Print a brief success line — the summary lives in the agent's context.
+	if isFork {
+		fmt.Printf("merged %q into %q (%d messages since fork)\n", srcName, s.activeSession, len(delta))
+	} else {
+		fmt.Printf("merged %q into %q (%d messages)\n", srcName, s.activeSession, len(delta))
+	}
+
+	return nil
+}
+
+// buildSummaryMessages builds the LLM prompt used to summarise a session delta.
+// The response is expected in two labeled sections:
+//
+//	Summary: <2-4 sentence overview of what was done and concluded>
+//	Query when: <one sentence describing what topics this session can answer>
+func buildSummaryMessages(delta []llm.ChatMessage, srcName string) []llm.ChatMessage {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "The following is a conversation from a shell session named %q.\n\n", srcName)
+	for _, m := range delta {
+		switch m.Role {
+		case "user":
+			if m.Content != "" {
+				fmt.Fprintf(&sb, "User: %s\n", m.Content)
+			}
+		case "assistant":
+			if m.Content != "" {
+				fmt.Fprintf(&sb, "Assistant: %s\n", m.Content)
+			}
+		}
+	}
+	sb.WriteString(`
+Respond with exactly two labeled lines (no other text):
+
+Summary: <2-4 sentences on what was explored and what was concluded. Focus on outcomes and key artifacts, not the process.>
+Query when: <one sentence describing what kinds of questions or topics this session can answer, so another agent knows when to query it>`)
+
+	return []llm.ChatMessage{
+		{Role: "system", Content: "You summarize shell sessions for other AI agents. Be factual and concise."},
+		{Role: "user", Content: sb.String()},
+	}
+}
+
+// parseSummaryResponse splits an LLM summary response into (summary, queryWhen).
+// Expects lines starting with "Summary:" and "Query when:".
+// Falls back gracefully if the model didn't follow the format.
+func parseSummaryResponse(raw string) (summary, queryWhen string) {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(line, "Summary:"); ok {
+			summary = strings.TrimSpace(after)
+		} else if after, ok := strings.CutPrefix(line, "Query when:"); ok {
+			queryWhen = strings.TrimSpace(after)
+		}
+	}
+	if summary == "" {
+		summary = strings.TrimSpace(raw)
+	}
+	return
 }

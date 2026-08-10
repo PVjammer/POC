@@ -27,7 +27,7 @@ import (
 var Subcommands = map[string]bool{
 	"ask": true, "do": true, "cm": true,
 	"ctx": true, "jobs": true, "job": true,
-	"session": true, "help": true,
+	"session": true, "skill": true, "help": true,
 }
 
 // Run dispatches the given args (starting with the subcommand name).
@@ -54,6 +54,8 @@ func Run(args []string) error {
 		return runJob(rest)
 	case "session":
 		return runSession(rest)
+	case "skill":
+		return runSkillCLI(rest)
 	case "help", "--help", "-h":
 		printHelp()
 		return nil
@@ -80,6 +82,9 @@ func printHelp() {
 	fmt.Println("  job <id|name>             print output of a job")
 	fmt.Println("  session list              list persisted sessions")
 	fmt.Println("  session clear [name]      remove session history files")
+	fmt.Println("  skill install <path>      install a skill from a directory")
+	fmt.Println("  skill list                list installed skills")
+	fmt.Println("  skill remove <name>       remove an installed skill")
 	fmt.Println()
 	fmt.Println("Flags (ask / do):")
 	fmt.Println("  --session <name>          use a named session (default: main)")
