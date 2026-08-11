@@ -1620,7 +1620,7 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model, endpoint, and provider")
-	fmt.Println("  /model <alias>     switch using a configured agent's model/endpoint/provider")
+	fmt.Println("  /model <alias>     switch to a named preset ([models.<alias>] in config.toml)")
 	fmt.Println("  /model <name> [endpoint] [provider]  switch to a literal model/endpoint/provider")
 	fmt.Println("  /history           show number of messages in context")
 	fmt.Println("  /exit              exit the shell")

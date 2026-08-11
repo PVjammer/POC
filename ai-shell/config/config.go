@@ -29,10 +29,11 @@ type PromptConfig struct {
 	Suffix        string `toml:"suffix"`            // text after all segments, e.g. " $ "
 }
 
-// LLMConfig holds the persistent default LLM connection. It is the lowest
-// layer of the priority chain: hardcoded default < this config < env vars
-// (AI_SHELL_PROVIDER/MODEL/ENDPOINT/API_KEY) < CLI flags < per-agent config
-// (see config.AgentConfig and shell.newProviderKind).
+// LLMConfig holds an LLM connection: provider kind plus model/endpoint/key.
+// Used both as the persistent default ([llm] in config.toml) and as a named
+// preset ([models.<alias>]) that "/model <alias>" can switch to directly —
+// a pure connection swap, independent of agent configs (which have their
+// own model/endpoint/provider fields for when a persona should pin one).
 type LLMConfig struct {
 	Provider string `toml:"provider"` // "ollama" (default) | "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
 	Model    string `toml:"model"`
@@ -47,7 +48,16 @@ type Config struct {
 	ToolOverflow       ToolOverflow `toml:"tool_output_overflow"`
 	CtxInlineThreshold int          `toml:"ctx_inline_threshold"` // bytes; slots larger than this become stubs
 	Prompt             PromptConfig `toml:"prompt"`
-	LLM                LLMConfig    `toml:"llm"`
+
+	// LLM is the persistent default connection: hardcoded default < LLM <
+	// env vars (AI_SHELL_PROVIDER/MODEL/ENDPOINT/API_KEY) < CLI flags.
+	LLM LLMConfig `toml:"llm"`
+
+	// Models holds named LLM presets ([models.<alias>] in config.toml) that
+	// "/model <alias>" resolves directly, e.g. [models."qwen3.6"] pointing
+	// at a llama.cpp server — independent of the agent-config system. Quote
+	// alias names containing "." in TOML (a bare dot nests tables instead).
+	Models map[string]LLMConfig `toml:"models"`
 
 	// Context / compaction settings.
 	ToolOutputKeepRounds   int     `toml:"tool_output_keep_rounds"`  // rounds of tool outputs to keep verbatim
@@ -195,13 +205,23 @@ func DefaultTOML() string {
 
 [llm]
 # Persistent default LLM connection — used when AI_SHELL_* env vars and
-# CLI flags are unset. Overridden by AI_SHELL_PROVIDER/MODEL/ENDPOINT/API_KEY
-# and by --provider/--model/--endpoint, and per-agent by [agents.<name>] in
+# CLI flags are unset. Overridden by AI_SHELL_PROVIDER/MODEL/ENDPOINT/API_KEY,
+# by --provider/--model/--endpoint, and per-agent by [agents.<name>] in
 # agents.toml (see /agent edit).
 # provider = "ollama"   # "ollama" or "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
 # model    = "llama3.2"
 # endpoint = "http://localhost:11434"
 # api_key  = ""         # bearer token for "openai"; leave empty for unauthenticated servers
+
+# Named LLM presets — "/model <alias>" switches straight to one, e.g.
+# "/model qwen3.6" — without touching tools/skills/system_prompt the way
+# "/agent <name>" would. Independent of the agent-config system. Quote the
+# alias if it contains a "." (a bare dot nests tables in TOML instead).
+# [models."qwen3.6"]
+# provider = "openai"
+# model    = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL"
+# endpoint = "http://192.168.1.88:30000/v1"
+# api_key  = ""
 `
 }
 

@@ -257,10 +257,10 @@ func (s *Shell) agentCreate(name string) {
 	template := fmt.Sprintf(`# Agent: %s
 # Place this file in ~/.config/baish/agents/ or .baish/agents/
 #
-# If you only set model/endpoint/provider below (leave tools/skills/prompt
-# alone), this doubles as a model alias: "/model %s" switches the active
-# connection without changing personas, same as "/agent %s" would but
-# without touching tools/skills/system_prompt.
+# For a pure model shortcut ("/model <alias>", no persona change), define a
+# named preset in ~/.config/baish/config.toml's [models."<alias>"] instead —
+# see /config edit. This file is for personas: tools, skills, prompt, and
+# optionally a pinned model/endpoint/provider for this agent specifically.
 
 [agents.%s]
 description = ""
@@ -282,7 +282,7 @@ description = ""
 # additional_instructions = "Always respond in markdown."
 
 # max_rounds = 10  # cap on tool-call rounds; global default is 25
-`, name, name, name, name)
+`, name, name)
 
 	if err := ensureFile(path, template); err != nil {
 		fmt.Fprintf(os.Stderr, "agent create: %v\n", err)
