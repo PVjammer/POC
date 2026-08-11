@@ -29,6 +29,17 @@ type PromptConfig struct {
 	Suffix        string `toml:"suffix"`            // text after all segments, e.g. " $ "
 }
 
+// LLMConfig holds the persistent default LLM connection. It is the lowest
+// layer of the priority chain: hardcoded default < this config < env vars
+// (AI_SHELL_PROVIDER/MODEL/ENDPOINT/API_KEY) < CLI flags < per-agent config
+// (see config.AgentConfig and shell.newProviderKind).
+type LLMConfig struct {
+	Provider string `toml:"provider"` // "ollama" (default) | "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
+	Model    string `toml:"model"`
+	Endpoint string `toml:"endpoint"`
+	APIKey   string `toml:"api_key"` // bearer token for "openai"; empty for unauthenticated servers
+}
+
 // Config holds tuneable shell settings.
 type Config struct {
 	MaxHistoryMessages int          `toml:"max_history_messages"`
@@ -36,6 +47,7 @@ type Config struct {
 	ToolOverflow       ToolOverflow `toml:"tool_output_overflow"`
 	CtxInlineThreshold int          `toml:"ctx_inline_threshold"` // bytes; slots larger than this become stubs
 	Prompt             PromptConfig `toml:"prompt"`
+	LLM                LLMConfig    `toml:"llm"`
 
 	// Context / compaction settings.
 	ToolOutputKeepRounds   int     `toml:"tool_output_keep_rounds"`  // rounds of tool outputs to keep verbatim
@@ -180,6 +192,16 @@ func DefaultTOML() string {
 # branch_color    = "magenta"
 # job_color       = "yellow"
 # suffix          = " $ "
+
+[llm]
+# Persistent default LLM connection — used when AI_SHELL_* env vars and
+# CLI flags are unset. Overridden by AI_SHELL_PROVIDER/MODEL/ENDPOINT/API_KEY
+# and by --provider/--model/--endpoint, and per-agent by [agents.<name>] in
+# agents.toml (see /agent edit).
+# provider = "ollama"   # "ollama" or "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
+# model    = "llama3.2"
+# endpoint = "http://localhost:11434"
+# api_key  = ""         # bearer token for "openai"; leave empty for unauthenticated servers
 `
 }
 

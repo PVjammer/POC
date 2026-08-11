@@ -252,3 +252,105 @@ func TestOpenAIProvider_ListModels(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestStripThinking(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no think block", "just an answer", "just an answer"},
+		{"leading think block", "<think>reasoning here</think>the answer", "the answer"},
+		{"think block with newlines", "<think>\nline one\nline two\n</think>\n\nthe answer", "the answer"},
+		{"unclosed think block yields empty", "<think>never finished", ""},
+		{"empty after stripping", "<think>only reasoning, no answer</think>", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, stripThinking(tt.in))
+		})
+	}
+}
+
+func TestOaiMessage_FinalText(t *testing.T) {
+	t.Run("plain content passes through", func(t *testing.T) {
+		m := oaiMessage{Content: strPtr("hello")}
+		assert.Equal(t, "hello", m.finalText())
+	})
+
+	t.Run("strips inline think block", func(t *testing.T) {
+		m := oaiMessage{Content: strPtr("<think>hmm</think>the real answer")}
+		assert.Equal(t, "the real answer", m.finalText())
+	})
+
+	t.Run("falls back to reasoning_content when content is empty", func(t *testing.T) {
+		m := oaiMessage{Content: strPtr(""), ReasoningContent: strPtr("<think>x</think>fallback answer")}
+		assert.Equal(t, "fallback answer", m.finalText())
+	})
+
+	t.Run("truncated think block with no reasoning_content yields empty", func(t *testing.T) {
+		m := oaiMessage{Content: strPtr("<think>never finished")}
+		assert.Equal(t, "", m.finalText())
+	})
+
+	t.Run("truncated think block falls back to reasoning_content if present", func(t *testing.T) {
+		m := oaiMessage{Content: strPtr("<think>never finished"), ReasoningContent: strPtr("<think>x</think>fallback")}
+		assert.Equal(t, "fallback", m.finalText())
+	})
+}
+
+func TestThinkFilter(t *testing.T) {
+	t.Run("leading think block suppressed, remainder streamed", func(t *testing.T) {
+		f := &thinkFilter{}
+		var out string
+		for _, chunk := range []string{"<thi", "nk>reason", "ing here</thi", "nk>the ", "answer"} {
+			out += f.feed(chunk)
+		}
+		out += f.flush()
+		assert.Equal(t, "the answer", out)
+	})
+
+	t.Run("plain content passes through immediately, no delay", func(t *testing.T) {
+		f := &thinkFilter{}
+		assert.Equal(t, "hel", f.feed("hel"))
+		assert.Equal(t, "lo", f.feed("lo"))
+	})
+
+	t.Run("near-miss prefix flushed as real content", func(t *testing.T) {
+		f := &thinkFilter{}
+		var out string
+		out += f.feed("<thinking") // diverges from "<think>" at the 7th char
+		out += f.feed(" about it")
+		assert.Equal(t, "<thinking about it", out)
+	})
+
+	t.Run("unclosed think block at stream end is discarded", func(t *testing.T) {
+		f := &thinkFilter{}
+		out := f.feed("<think>never closes")
+		out += f.flush()
+		assert.Equal(t, "", out)
+	})
+}
+
+func TestOpenAIProvider_ChatMessages_NonStreaming_StripsThinkBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := oaiChatResponse{Model: "qwen3"}
+		resp.Choices = []struct {
+			Message      oaiMessage `json:"message"`
+			FinishReason string     `json:"finish_reason"`
+		}{{
+			Message:      oaiMessage{Role: "assistant", Content: strPtr("<think>let me think about this</think>The capital of France is Paris.")},
+			FinishReason: "stop",
+		}}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	p, err := NewOpenAIProvider(srv.URL, "qwen3")
+	require.NoError(t, err)
+
+	ch := p.ChatMessages(context.Background(), []llm.ChatMessage{{Role: "user", Content: "capital of France?"}}, llm.DefaultOptions())
+	resp, err := llm.CollectResponse(context.Background(), ch)
+	require.NoError(t, err)
+	assert.Equal(t, "The capital of France is Paris.", resp.Text)
+}

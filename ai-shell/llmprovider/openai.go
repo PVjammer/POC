@@ -258,7 +258,7 @@ func (p *OpenAIProvider) syncChat(ctx context.Context, req oaiChatRequest, ch ch
 
 	choice := parsed.Choices[0]
 	chunk := llm.StreamChunk{
-		Text:             choice.Message.contentString(),
+		Text:             choice.Message.finalText(),
 		Done:             true,
 		TokensUsed:       parsed.Usage.TotalTokens,
 		PromptTokens:     parsed.Usage.PromptTokens,
@@ -297,6 +297,7 @@ func (p *OpenAIProvider) streamChat(ctx context.Context, req oaiChatRequest, ch 
 
 	var model string
 	var finishReason string
+	filter := &thinkFilter{}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -331,12 +332,17 @@ func (p *OpenAIProvider) streamChat(ctx context.Context, req oaiChatRequest, ch 
 			finishReason = delta.FinishReason
 		}
 		if delta.Delta.Content != "" {
-			ch <- llm.StreamChunk{Text: delta.Delta.Content}
+			if out := filter.feed(delta.Delta.Content); out != "" {
+				ch <- llm.StreamChunk{Text: out}
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		ch <- llm.StreamChunk{Error: fmt.Errorf("read stream: %w", err), Done: true}
 		return
+	}
+	if out := filter.flush(); out != "" {
+		ch <- llm.StreamChunk{Text: out}
 	}
 
 	ch <- llm.StreamChunk{
@@ -437,6 +443,11 @@ type oaiMessage struct {
 	Content    *string       `json:"content"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
+
+	// ReasoningContent is populated by servers (llama.cpp, DeepSeek-style
+	// APIs) that split a reasoning model's <think> block out of Content.
+	// Only read on responses; never set on outgoing request messages.
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
 }
 
 // contentString returns Content, treating a nil pointer (tool-call-only
@@ -446,6 +457,90 @@ func (m oaiMessage) contentString() string {
 		return ""
 	}
 	return *m.Content
+}
+
+// stripThinking removes a leading <think>...</think> block from s, using the
+// same thinkFilter logic streaming responses use — so both paths agree on
+// the same edge case: a block that opens but never closes (truncated by a
+// token limit) has no recoverable answer and yields "", rather than leaking
+// the dangling "<think>" tag as if it were real content.
+func stripThinking(s string) string {
+	f := &thinkFilter{}
+	return strings.TrimSpace(f.feed(s) + f.flush())
+}
+
+// finalText returns the message's answer text with any inline <think> block
+// removed. If that leaves nothing — e.g. the model spent its whole token
+// budget thinking and never reached an answer, or a server splits reasoning
+// into ReasoningContent but the answer landed there too — it falls back to
+// a cleaned ReasoningContent rather than reporting an empty response.
+func (m oaiMessage) finalText() string {
+	if clean := stripThinking(m.contentString()); clean != "" {
+		return clean
+	}
+	if m.ReasoningContent != nil {
+		return stripThinking(*m.ReasoningContent)
+	}
+	return ""
+}
+
+const (
+	thinkOpenTag  = "<think>"
+	thinkCloseTag = "</think>"
+)
+
+// thinkFilter suppresses a single leading <think>...</think> block from a
+// stream of text deltas, forwarding everything else unchanged. It only
+// buffers while a leading block is still possible (the same behavior
+// stripThinking gives non-streaming responses); once the stream diverges
+// from "<think>" or the block closes, deltas pass straight through.
+type thinkFilter struct {
+	buf   strings.Builder
+	state int // 0=detecting, 1=inside a think block, 2=passthrough
+}
+
+// feed processes one delta and returns the text (possibly empty) that
+// should be forwarded to the caller.
+func (f *thinkFilter) feed(s string) string {
+	if f.state == 2 {
+		return s
+	}
+
+	f.buf.WriteString(s)
+	buffered := f.buf.String()
+
+	if f.state == 0 {
+		switch {
+		case strings.HasPrefix(buffered, thinkOpenTag):
+			f.state = 1
+		case len(buffered) < len(thinkOpenTag) && strings.HasPrefix(thinkOpenTag, buffered):
+			return "" // still an unambiguous prefix of "<think>" — keep buffering
+		default:
+			f.state = 2
+			f.buf.Reset()
+			return buffered
+		}
+	}
+
+	// state == 1: inside the block, looking for the close tag.
+	if idx := strings.Index(buffered, thinkCloseTag); idx >= 0 {
+		rest := buffered[idx+len(thinkCloseTag):]
+		f.state = 2
+		f.buf.Reset()
+		return strings.TrimLeft(rest, "\n")
+	}
+	return ""
+}
+
+// flush returns any buffered text once the stream ends. If a "<think>"
+// prefix was never confirmed, the buffered text is real content and is
+// returned as-is. If a think block was opened but never closed (truncated
+// by a token limit), it's discarded — there's no answer to recover.
+func (f *thinkFilter) flush() string {
+	if f.state != 0 {
+		return ""
+	}
+	return f.buf.String()
 }
 
 type oaiToolCall struct {

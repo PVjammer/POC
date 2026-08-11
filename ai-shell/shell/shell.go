@@ -49,8 +49,14 @@ type Config struct {
 
 // Shell is the main REPL.
 type Shell struct {
-	cfg      Config
-	appCfg   config.Config
+	cfg Config
+	// startupCfg is an immutable snapshot of cfg as passed to New(), before any
+	// /agent or /model switch mutates cfg. applyAgentConfig falls back to this
+	// (not the mutable cfg) so agents with empty Model/Endpoint/Provider — most
+	// importantly "default" — always resolve to the true baseline connection
+	// instead of whatever agent happened to be active most recently.
+	startupCfg Config
+	appCfg     config.Config
 	rl       *readline.Instance
 	fnLoader *functions.Loader
 	jobs     *jobManager
@@ -130,6 +136,7 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 
 	s := &Shell{
 		cfg:             cfg,
+		startupCfg:      cfg,
 		appCfg:          appCfg,
 		rl:              rl,
 		fnLoader:        fnLoader,
@@ -193,6 +200,12 @@ func New(cfg Config, appCfg config.Config) (*Shell, error) {
 	// Initialize dynamic configuration: skills, agents, commands.
 	s.initDynamic()
 
+	// Apply any persisted [agents.default] overrides (model/endpoint/provider/
+	// system prompt/max_rounds) from agents.toml. A no-op when unset.
+	if err := s.applyAgentConfig("default", s.agentRegistry["default"]); err != nil {
+		fmt.Fprintf(os.Stderr, "\033[33m[agents] apply default config: %v\033[0m\n", err)
+	}
+
 	return s, nil
 }
 
@@ -217,6 +230,11 @@ func (s *Shell) initDynamic() {
 	}
 	for _, w := range warnings {
 		fmt.Fprintf(stderr, "\033[33m[agents] %s\033[0m\n", w)
+	}
+	if dflt, derr := config.LoadDefaultAgentConfig(); derr == nil {
+		registry["default"] = dflt
+	} else {
+		fmt.Fprintf(stderr, "\033[33m[agents] %v\033[0m\n", derr)
 	}
 	s.agentRegistry = registry
 
@@ -269,7 +287,17 @@ func (s *Shell) onConfigChange(path string) {
 	for _, w := range warnings {
 		fmt.Fprintf(stderr, "\033[33m[agents] %s\033[0m\n", w)
 	}
+	if dflt, derr := config.LoadDefaultAgentConfig(); derr == nil {
+		registry["default"] = dflt
+	} else {
+		fmt.Fprintf(stderr, "\033[33m[agents] %v\033[0m\n", derr)
+	}
 	s.agentRegistry = registry
+	if s.activeAgentName == "default" {
+		if err := s.applyAgentConfig("default", s.agentRegistry["default"]); err != nil {
+			fmt.Fprintf(stderr, "\033[33m[agents] apply default config: %v\033[0m\n", err)
+		}
+	}
 
 	cmds, warnings, _ := config.LoadCommandFiles(commandConfigPaths()...)
 	for _, w := range warnings {
@@ -1035,9 +1063,9 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			return false
 		case "model":
 			if s.ocClient != nil {
-				fmt.Printf("usage: /model <name> [endpoint] [provider]\nbackend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
+				fmt.Printf("usage: /model <alias> | <name> [endpoint] [provider]\nbackend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
 			} else {
-				fmt.Printf("usage: /model <name> [endpoint] [provider]\nmodel: %s  endpoint: %s  provider: %s\n", s.cfg.Model, s.cfg.Endpoint, providerOrDefault(s.cfg.Provider))
+				fmt.Printf("usage: /model <alias> | <name> [endpoint] [provider]\nmodel: %s  endpoint: %s  provider: %s\n", s.cfg.Model, s.cfg.Endpoint, providerOrDefault(s.cfg.Provider))
 			}
 			return false
 		case "commit-msg", "commit", "cm":
@@ -1091,12 +1119,15 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			} else {
 				fmt.Printf("model: %s  endpoint: %s  provider: %s\n", s.cfg.Model, s.cfg.Endpoint, providerOrDefault(s.cfg.Provider))
 			}
+		} else if len(args) == 1 {
+			if err := s.setModelByAliasOrLiteral(args[0]); err != nil {
+				fmt.Fprintf(os.Stderr, "model: %v\n", err)
+			} else {
+				fmt.Printf("model: switched to %s  endpoint: %s  provider: %s\n", s.cfg.Model, s.cfg.Endpoint, providerOrDefault(s.cfg.Provider))
+			}
 		} else {
 			model := args[0]
-			endpoint := s.cfg.Endpoint
-			if len(args) > 1 {
-				endpoint = args[1]
-			}
+			endpoint := args[1]
 			providerKind := s.cfg.Provider
 			if len(args) > 2 {
 				providerKind = args[2]
@@ -1589,7 +1620,8 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
 	fmt.Println("  /model             show current model, endpoint, and provider")
-	fmt.Println("  /model <name> [endpoint] [provider]  switch model/endpoint/provider (\"ollama\"|\"openai\")")
+	fmt.Println("  /model <alias>     switch using a configured agent's model/endpoint/provider")
+	fmt.Println("  /model <name> [endpoint] [provider]  switch to a literal model/endpoint/provider")
 	fmt.Println("  /history           show number of messages in context")
 	fmt.Println("  /exit              exit the shell")
 	fmt.Println()

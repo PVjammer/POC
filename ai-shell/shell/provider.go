@@ -30,3 +30,30 @@ func providerOrDefault(kind string) string {
 	}
 	return kind
 }
+
+// setModelByAliasOrLiteral implements "/model <name>" with a single argument:
+// if name matches a registered agent (the same lookup /agent <name> uses —
+// named agents, "default", but never "one_shot"), its model/endpoint/provider
+// are applied, with empty fields falling back to startupCfg exactly like
+// applyAgentConfig. This lets a config like:
+//
+//	[agents.qwen3.6]
+//	model    = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF:UD-Q4_K_XL"
+//	endpoint = "http://192.168.1.88:30000/v1"
+//	provider = "openai"
+//
+// be switched to with "/model qwen3.6" — a pure connection swap, unlike
+// "/agent qwen3.6" which would also change tools/skills/system_prompt.
+//
+// Only fires for names that match a known agent; anything else falls back to
+// today's behavior of treating name as a literal model string against the
+// currently active endpoint/provider.
+func (s *Shell) setModelByAliasOrLiteral(name string) error {
+	if cfg, ok := s.agentRegistry[name]; ok {
+		model := firstNonEmpty(cfg.Model, s.startupCfg.Model)
+		endpoint := firstNonEmpty(cfg.Endpoint, s.startupCfg.Endpoint)
+		providerKind := firstNonEmpty(cfg.Provider, s.startupCfg.Provider)
+		return s.setModel(model, endpoint, providerKind)
+	}
+	return s.setModel(name, s.cfg.Endpoint, s.cfg.Provider)
+}

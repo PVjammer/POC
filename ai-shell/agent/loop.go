@@ -377,6 +377,16 @@ func (l *Loop) Run(ctx context.Context, userMsg string, onToken func(string)) er
 			return fmt.Errorf("llm: %w", final.Error)
 		}
 
+		// Strip a leading <think>...</think> reasoning block some models
+		// (Qwen3 and similar) emit inline before their real answer. This is
+		// provider-agnostic on purpose: providers aren't guaranteed to split
+		// reasoning out on their own (e.g. Ollama's Thinking field requires
+		// opting in via ChatRequest.Think, which nothing here sets), and
+		// leaving it in risks bloating every subsequent round's history with
+		// repeated chain-of-thought noise instead of a clean signal of what
+		// was tried and what happened.
+		final.Text = stripThinking(final.Text)
+
 		// Belt-and-suspenders: if the provider returned no structured ToolCalls
 		// (e.g. native mode is on but the model used a text-format call anyway),
 		// try to parse them from the text response.

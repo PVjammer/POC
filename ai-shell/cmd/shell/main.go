@@ -40,10 +40,11 @@ func main() {
 	}
 
 	cfg := shell.Config{
-		Model:         env("AI_SHELL_MODEL", "llama3.2"),
-		Endpoint:      env("AI_SHELL_ENDPOINT", "http://localhost:11434"),
-		Provider:      env("AI_SHELL_PROVIDER", "ollama"), // "ollama" | "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
-		APIKey:        env("AI_SHELL_API_KEY", ""),
+		// Priority: hardcoded default < appCfg.LLM (~/.config/baish/config.toml) < env var.
+		Model:         env("AI_SHELL_MODEL", firstNonEmpty(appCfg.LLM.Model, "llama3.2")),
+		Endpoint:      env("AI_SHELL_ENDPOINT", firstNonEmpty(appCfg.LLM.Endpoint, "http://localhost:11434")),
+		Provider:      env("AI_SHELL_PROVIDER", firstNonEmpty(appCfg.LLM.Provider, "ollama")), // "ollama" | "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
+		APIKey:        env("AI_SHELL_API_KEY", appCfg.LLM.APIKey),
 		OpenCodeURL:   ocURL,
 		OpenCodeModel: env("AI_OPENCODE_MODEL", ""),
 		ResumeSession: resumeID,
@@ -149,4 +150,13 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

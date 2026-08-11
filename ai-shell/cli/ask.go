@@ -36,19 +36,20 @@ func runAsk(args []string, act bool) error {
 	}
 
 	appCfg, _ := config.Load()
+	// Priority: hardcoded default < appCfg.LLM (config.toml) < env var < --flag.
 	model := opts.model
 	if model == "" {
-		model = envOr("AI_SHELL_MODEL", "llama3.2")
+		model = envOr("AI_SHELL_MODEL", firstNonEmpty(appCfg.LLM.Model, "llama3.2"))
 	}
 	endpoint := opts.endpoint
 	if endpoint == "" {
-		endpoint = envOr("AI_SHELL_ENDPOINT", "http://localhost:11434")
+		endpoint = envOr("AI_SHELL_ENDPOINT", firstNonEmpty(appCfg.LLM.Endpoint, "http://localhost:11434"))
 	}
 	providerKind := opts.provider
 	if providerKind == "" {
-		providerKind = envOr("AI_SHELL_PROVIDER", "ollama")
+		providerKind = envOr("AI_SHELL_PROVIDER", firstNonEmpty(appCfg.LLM.Provider, "ollama"))
 	}
-	apiKey := envOr("AI_SHELL_API_KEY", "")
+	apiKey := envOr("AI_SHELL_API_KEY", appCfg.LLM.APIKey)
 
 	provider, err := llmprovider.New(providerKind, endpoint, model, apiKey)
 	if err != nil {
@@ -161,6 +162,15 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func humanSize(n int) string {

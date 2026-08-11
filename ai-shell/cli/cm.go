@@ -29,10 +29,11 @@ func runCm(args []string) error {
 	}
 
 	appCfg, _ := config.Load()
-	model := envOr("AI_SHELL_MODEL", "llama3.2")
-	endpoint := envOr("AI_SHELL_ENDPOINT", "http://localhost:11434")
-	providerKind := envOr("AI_SHELL_PROVIDER", "ollama")
-	apiKey := envOr("AI_SHELL_API_KEY", "")
+	// Priority: hardcoded default < appCfg.LLM (config.toml) < env var.
+	model := envOr("AI_SHELL_MODEL", firstNonEmpty(appCfg.LLM.Model, "llama3.2"))
+	endpoint := envOr("AI_SHELL_ENDPOINT", firstNonEmpty(appCfg.LLM.Endpoint, "http://localhost:11434"))
+	providerKind := envOr("AI_SHELL_PROVIDER", firstNonEmpty(appCfg.LLM.Provider, "ollama"))
+	apiKey := envOr("AI_SHELL_API_KEY", appCfg.LLM.APIKey)
 
 	provider, err := llmprovider.New(providerKind, endpoint, model, apiKey)
 	if err != nil {

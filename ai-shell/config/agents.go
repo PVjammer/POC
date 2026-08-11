@@ -89,6 +89,27 @@ func AgentsFile() string {
 	return filepath.Join(home, ".config", "baish", "agents.toml")
 }
 
+// LoadDefaultAgentConfig reads the [agents.default] section from AgentsFile() —
+// the one place "default" is allowed (LoadAgentFiles rejects it everywhere
+// else as a reserved name). This is the file /agent edit default opens and
+// SaveAgentDefault writes to; it lets users override the built-in default
+// agent's model/endpoint/provider/system_prompt/etc. Returns the zero
+// AgentConfig if the file or section doesn't exist.
+func LoadDefaultAgentConfig() (AgentConfig, error) {
+	data, err := os.ReadFile(AgentsFile())
+	if os.IsNotExist(err) {
+		return AgentConfig{}, nil
+	}
+	if err != nil {
+		return AgentConfig{}, fmt.Errorf("agents: read %s: %w", AgentsFile(), err)
+	}
+	var af agentsFile
+	if err := toml.Unmarshal(data, &af); err != nil {
+		return AgentConfig{}, fmt.Errorf("agents: parse %s: %w", AgentsFile(), err)
+	}
+	return af.Agents["default"], nil
+}
+
 // ProjectAgentsDir returns the project-local agents config directory.
 func ProjectAgentsDir() string {
 	return filepath.Join(".baish", "agents")

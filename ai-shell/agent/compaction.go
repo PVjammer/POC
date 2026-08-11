@@ -43,7 +43,10 @@ func (l *Loop) runCompaction(ctx context.Context) error {
 
 	prompt := l.buildCompactionPrompt(middle)
 
-	opts := llm.DefaultOptions().WithMaxTokens(1000).WithTemperature(0.1)
+	// 2048 rather than 1000: reasoning models (Qwen3 via llama.cpp, etc.) spend
+	// part of the budget on a <think> block before the actual summary, and a
+	// tight budget risks truncating mid-thought with nothing left to show for it.
+	opts := llm.DefaultOptions().WithMaxTokens(2048).WithTemperature(0.1)
 	ch := l.provider.Ainvoke(ctx, prompt, opts)
 	resp, err := llm.CollectResponse(ctx, ch)
 	if err != nil {

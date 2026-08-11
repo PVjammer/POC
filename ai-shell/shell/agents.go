@@ -110,6 +110,9 @@ func (s *Shell) agentList() {
 	fmt.Printf("%-22s %-8s %s\n", "one_shot", mark("one_shot"), "Direct LLM call — no tool loop, no history")
 
 	for name, cfg := range s.agentRegistry {
+		if name == "default" || name == "one_shot" {
+			continue // already printed above; registry only holds default's overrides
+		}
 		desc := cfg.Description
 		if desc == "" {
 			desc = "-"
@@ -124,9 +127,13 @@ func (s *Shell) applyAgentConfig(name string, cfg config.AgentConfig) error {
 	sess := s.currentSession()
 
 	// Switch provider if model/endpoint/provider differ from what is currently active.
-	newModel := firstNonEmpty(cfg.Model, s.cfg.Model)
-	newEndpoint := firstNonEmpty(cfg.Endpoint, s.cfg.Endpoint)
-	newProviderKind := firstNonEmpty(cfg.Provider, s.cfg.Provider)
+	// Empty fields fall back to startupCfg (the true baseline), not the mutable
+	// s.cfg — otherwise switching to an agent that overrides the connection and
+	// then back to one that doesn't (e.g. "default") can never restore it, since
+	// s.cfg itself was what got overwritten.
+	newModel := firstNonEmpty(cfg.Model, s.startupCfg.Model)
+	newEndpoint := firstNonEmpty(cfg.Endpoint, s.startupCfg.Endpoint)
+	newProviderKind := firstNonEmpty(cfg.Provider, s.startupCfg.Provider)
 	if newModel != s.cfg.Model || newEndpoint != s.cfg.Endpoint || newProviderKind != s.cfg.Provider {
 		if err := s.setModel(newModel, newEndpoint, newProviderKind); err != nil {
 			return fmt.Errorf("switch model: %w", err)
@@ -158,9 +165,12 @@ func (s *Shell) applyAgentConfig(name string, cfg config.AgentConfig) error {
 // runAgentOneOff runs a single query with a temporary loop configured for agentName.
 // The current session and its history are not modified.
 func (s *Shell) runAgentOneOff(agentName string, cfg config.AgentConfig, query string) {
-	model := firstNonEmpty(cfg.Model, s.cfg.Model)
-	endpoint := firstNonEmpty(cfg.Endpoint, s.cfg.Endpoint)
-	provider, err := s.newProviderKind(cfg.Provider, endpoint, model)
+	// Empty fields fall back to startupCfg, not the mutable s.cfg — see the
+	// comment in applyAgentConfig for why.
+	model := firstNonEmpty(cfg.Model, s.startupCfg.Model)
+	endpoint := firstNonEmpty(cfg.Endpoint, s.startupCfg.Endpoint)
+	providerKind := firstNonEmpty(cfg.Provider, s.startupCfg.Provider)
+	provider, err := s.newProviderKind(providerKind, endpoint, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent one-off: %v\n", err)
 		return
@@ -246,12 +256,18 @@ func (s *Shell) agentCreate(name string) {
 	path := filepath.Join(config.AgentsDir(), name+".toml")
 	template := fmt.Sprintf(`# Agent: %s
 # Place this file in ~/.config/baish/agents/ or .baish/agents/
+#
+# If you only set model/endpoint/provider below (leave tools/skills/prompt
+# alone), this doubles as a model alias: "/model %s" switches the active
+# connection without changing personas, same as "/agent %s" would but
+# without touching tools/skills/system_prompt.
 
 [agents.%s]
 description = ""
 
 # model    = ""   # leave empty to use the global model
 # endpoint = ""   # leave empty to use the global endpoint
+# provider = ""   # "ollama" or "openai" (llama.cpp, vLLM, LM Studio, real OpenAI); empty = global default
 
 # tools = ["bash", "read_file", "write_file"]  # empty = all tools
 
@@ -266,7 +282,7 @@ description = ""
 # additional_instructions = "Always respond in markdown."
 
 # max_rounds = 10  # cap on tool-call rounds; global default is 25
-`, name, name)
+`, name, name, name, name)
 
 	if err := ensureFile(path, template); err != nil {
 		fmt.Fprintf(os.Stderr, "agent create: %v\n", err)
@@ -312,8 +328,13 @@ func (s *Shell) agentEdit(name string) {
 	template := `# Global agent overrides — ~/.config/baish/agents.toml
 # You can also place individual *.toml files in ~/.config/baish/agents/
 
-# Override settings for the built-in default agent:
+# Override settings for the built-in default agent — applied automatically
+# every time baish starts (takes effect immediately if you're already
+# running baish; the config file watcher picks up saved changes).
 # [agents.default]
+# model    = ""          # leave empty to use AI_SHELL_MODEL / [llm] config
+# endpoint = ""          # leave empty to use AI_SHELL_ENDPOINT / [llm] config
+# provider = ""          # "ollama" or "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
 # excluded_skills = []   # skill names to hide from the ! agent
 # additional_instructions = ""
 # max_rounds = 25
