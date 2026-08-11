@@ -114,7 +114,7 @@ func (s *Shell) createSession(name, parent string, hist []llm.ChatMessage, ctxCo
 		return nil, fmt.Errorf("session name must be non-empty with no spaces or slashes")
 	}
 
-	provider, err := llm.NewOllamaProvider(s.cfg.Endpoint, s.cfg.Model)
+	provider, err := s.newProvider(s.cfg.Endpoint, s.cfg.Model)
 	if err != nil {
 		return nil, fmt.Errorf("create provider: %w", err)
 	}
@@ -493,7 +493,7 @@ func (s *Shell) doMerge(srcName string, edit bool) error {
 
 	// Summarise the delta.
 	fmt.Printf("summarizing %q (%d messages)...\n", srcName, len(delta))
-	provider, err := llm.NewOllamaProvider(s.cfg.Endpoint, s.cfg.Model)
+	provider, err := s.newProvider(s.cfg.Endpoint, s.cfg.Model)
 	if err != nil {
 		return fmt.Errorf("create provider: %w", err)
 	}

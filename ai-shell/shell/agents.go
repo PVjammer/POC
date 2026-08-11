@@ -123,11 +123,12 @@ func (s *Shell) agentList() {
 func (s *Shell) applyAgentConfig(name string, cfg config.AgentConfig) error {
 	sess := s.currentSession()
 
-	// Switch provider if model/endpoint differ from what is currently active.
+	// Switch provider if model/endpoint/provider differ from what is currently active.
 	newModel := firstNonEmpty(cfg.Model, s.cfg.Model)
 	newEndpoint := firstNonEmpty(cfg.Endpoint, s.cfg.Endpoint)
-	if newModel != s.cfg.Model || newEndpoint != s.cfg.Endpoint {
-		if err := s.setModel(newModel, newEndpoint); err != nil {
+	newProviderKind := firstNonEmpty(cfg.Provider, s.cfg.Provider)
+	if newModel != s.cfg.Model || newEndpoint != s.cfg.Endpoint || newProviderKind != s.cfg.Provider {
+		if err := s.setModel(newModel, newEndpoint, newProviderKind); err != nil {
 			return fmt.Errorf("switch model: %w", err)
 		}
 	}
@@ -159,7 +160,7 @@ func (s *Shell) applyAgentConfig(name string, cfg config.AgentConfig) error {
 func (s *Shell) runAgentOneOff(agentName string, cfg config.AgentConfig, query string) {
 	model := firstNonEmpty(cfg.Model, s.cfg.Model)
 	endpoint := firstNonEmpty(cfg.Endpoint, s.cfg.Endpoint)
-	provider, err := llm.NewOllamaProvider(endpoint, model)
+	provider, err := s.newProviderKind(cfg.Provider, endpoint, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent one-off: %v\n", err)
 		return

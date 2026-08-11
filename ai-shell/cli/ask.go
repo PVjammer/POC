@@ -9,6 +9,7 @@ import (
 
 	"github.com/pvjammer/ai-shell-poc/agent"
 	"github.com/pvjammer/ai-shell-poc/config"
+	"github.com/pvjammer/ai-shell-poc/llmprovider"
 	"github.com/pvjammer/ai-shell-poc/tools"
 	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
@@ -17,6 +18,7 @@ type askOpts struct {
 	session  string
 	model    string
 	endpoint string
+	provider string
 	act      bool // true = agentic (do), false = advisory (ask)
 }
 
@@ -42,8 +44,13 @@ func runAsk(args []string, act bool) error {
 	if endpoint == "" {
 		endpoint = envOr("AI_SHELL_ENDPOINT", "http://localhost:11434")
 	}
+	providerKind := opts.provider
+	if providerKind == "" {
+		providerKind = envOr("AI_SHELL_PROVIDER", "ollama")
+	}
+	apiKey := envOr("AI_SHELL_API_KEY", "")
 
-	provider, err := llm.NewOllamaProvider(endpoint, model)
+	provider, err := llmprovider.New(providerKind, endpoint, model, apiKey)
 	if err != nil {
 		return fmt.Errorf("create provider: %w", err)
 	}
@@ -136,6 +143,12 @@ func parseAskArgs(args []string, act bool) (askOpts, string, error) {
 			}
 			i++
 			opts.endpoint = args[i]
+		case "--provider", "-p":
+			if i+1 >= len(args) {
+				return opts, "", fmt.Errorf("--provider requires a value")
+			}
+			i++
+			opts.provider = args[i]
 		default:
 			promptParts = append(promptParts, args[i])
 		}

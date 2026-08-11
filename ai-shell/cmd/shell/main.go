@@ -20,6 +20,7 @@ func main() {
 	// Otherwise start the interactive shell as usual.
 	if len(os.Args) > 1 && cli.Subcommands[os.Args[1]] {
 		if err := cli.Run(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "baish: %v\n", err)
 			os.Exit(1)
 		}
 		return
@@ -41,6 +42,8 @@ func main() {
 	cfg := shell.Config{
 		Model:         env("AI_SHELL_MODEL", "llama3.2"),
 		Endpoint:      env("AI_SHELL_ENDPOINT", "http://localhost:11434"),
+		Provider:      env("AI_SHELL_PROVIDER", "ollama"), // "ollama" | "openai" (llama.cpp, vLLM, LM Studio, real OpenAI)
+		APIKey:        env("AI_SHELL_API_KEY", ""),
 		OpenCodeURL:   ocURL,
 		OpenCodeModel: env("AI_OPENCODE_MODEL", ""),
 		ResumeSession: resumeID,

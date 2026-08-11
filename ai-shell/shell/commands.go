@@ -10,7 +10,6 @@ import (
 
 	"github.com/pvjammer/ai-shell-poc/agent"
 	"github.com/pvjammer/ai-shell-poc/config"
-	"github.com/pvjammer/ai-sdk-go/pkg/llm"
 )
 
 // runCustomCommand dispatches a user-defined /command from commandRegistry.
@@ -76,7 +75,7 @@ func (s *Shell) runCommandOneShot(prompt, piped, model, endpoint string) {
 	if endpoint == "" {
 		endpoint = s.cfg.Endpoint
 	}
-	provider, err := llm.NewOllamaProvider(endpoint, model)
+	provider, err := s.newProvider(endpoint, model)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "one-shot: %v\n", err)
 		return

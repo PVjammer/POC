@@ -39,6 +39,8 @@ type shellCtxSlot struct {
 type Config struct {
 	Model         string
 	Endpoint      string
+	Provider      string // "ollama" (default) | "openai" — see llmprovider.New
+	APIKey        string // bearer token for the "openai" provider; empty for unauthenticated servers
 	OpenCodeURL   string // non-empty = route agent calls through opencode serve
 	OpenCodeModel string // "providerID/modelID" e.g. "opencode/big-pickle"; empty = server default
 	ResumeSession string // session ID to resume (from --resume flag); empty = start fresh
@@ -396,7 +398,7 @@ func (s *Shell) Run() error {
 	if s.ocClient != nil {
 		fmt.Printf("baish %s  backend=opencode  url=%s  session=%s\n", s.cfg.Version, s.cfg.OpenCodeURL, s.ocClient.SessionID())
 	} else {
-		fmt.Printf("baish %s  model=%s  endpoint=%s\n", s.cfg.Version, s.cfg.Model, s.cfg.Endpoint)
+		fmt.Printf("baish %s  provider=%s  model=%s  endpoint=%s\n", s.cfg.Version, providerOrDefault(s.cfg.Provider), s.cfg.Model, s.cfg.Endpoint)
 	}
 	fmt.Println("  <cmd>          shell command  (ls, vim, git, ...)")
 	fmt.Println("  ?<msg>         ask the AI     (advisory — explains, no execution)")
@@ -1033,9 +1035,9 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			return false
 		case "model":
 			if s.ocClient != nil {
-				fmt.Printf("usage: /model <name> [endpoint]\nbackend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
+				fmt.Printf("usage: /model <name> [endpoint] [provider]\nbackend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
 			} else {
-				fmt.Printf("usage: /model <name> [endpoint]\nmodel: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+				fmt.Printf("usage: /model <name> [endpoint] [provider]\nmodel: %s  endpoint: %s  provider: %s\n", s.cfg.Model, s.cfg.Endpoint, providerOrDefault(s.cfg.Provider))
 			}
 			return false
 		case "commit-msg", "commit", "cm":
@@ -1087,7 +1089,7 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			if s.ocClient != nil {
 				fmt.Printf("backend: opencode  url: %s  session: %s\n", s.cfg.OpenCodeURL, s.ocClient.SessionID())
 			} else {
-				fmt.Printf("model: %s  endpoint: %s\n", s.cfg.Model, s.cfg.Endpoint)
+				fmt.Printf("model: %s  endpoint: %s  provider: %s\n", s.cfg.Model, s.cfg.Endpoint, providerOrDefault(s.cfg.Provider))
 			}
 		} else {
 			model := args[0]
@@ -1095,10 +1097,14 @@ func (s *Shell) runMeta(cmd string) (exit bool) {
 			if len(args) > 1 {
 				endpoint = args[1]
 			}
-			if err := s.setModel(model, endpoint); err != nil {
+			providerKind := s.cfg.Provider
+			if len(args) > 2 {
+				providerKind = args[2]
+			}
+			if err := s.setModel(model, endpoint, providerKind); err != nil {
 				fmt.Fprintf(os.Stderr, "model: %v\n", err)
 			} else {
-				fmt.Printf("model: switched to %s  endpoint: %s\n", model, endpoint)
+				fmt.Printf("model: switched to %s  endpoint: %s  provider: %s\n", model, endpoint, providerOrDefault(providerKind))
 			}
 		}
 
@@ -1582,8 +1588,8 @@ func (s *Shell) printHelp() {
 	fmt.Println("  /context [slot]    trigger /with context — store buffer as ctx slot")
 	fmt.Println("  /permissions [cmd] show permission tier for a command")
 	fmt.Println("  /clear             clear conversation history")
-	fmt.Println("  /model             show current model and endpoint")
-	fmt.Println("  /model <name>      switch to a different model")
+	fmt.Println("  /model             show current model, endpoint, and provider")
+	fmt.Println("  /model <name> [endpoint] [provider]  switch model/endpoint/provider (\"ollama\"|\"openai\")")
 	fmt.Println("  /history           show number of messages in context")
 	fmt.Println("  /exit              exit the shell")
 	fmt.Println()
@@ -1869,9 +1875,14 @@ func (s *Shell) syncAgentContext() {
 }
 
 // setModel switches the active session's LLM provider and updates the functions
-// loader. Other sessions keep their existing provider.
-func (s *Shell) setModel(model, endpoint string) error {
-	provider, err := llm.NewOllamaProvider(endpoint, model)
+// loader. Other sessions keep their existing provider. providerKind is "" to
+// keep the current s.cfg.Provider, or an explicit kind ("ollama"/"openai") to
+// switch it too.
+func (s *Shell) setModel(model, endpoint, providerKind string) error {
+	if providerKind == "" {
+		providerKind = s.cfg.Provider
+	}
+	provider, err := s.newProviderKind(providerKind, endpoint, model)
 	if err != nil {
 		return fmt.Errorf("create provider: %w", err)
 	}
@@ -1896,6 +1907,7 @@ func (s *Shell) setModel(model, endpoint string) error {
 
 	s.cfg.Model = model
 	s.cfg.Endpoint = endpoint
+	s.cfg.Provider = providerKind
 	return nil
 }
 
@@ -2567,7 +2579,7 @@ func (s *Shell) QuerySession(ctx context.Context, name, question string) (string
 		return "the session has no conversation history", nil
 	}
 
-	provider, err := llm.NewOllamaProvider(s.cfg.Endpoint, s.cfg.Model)
+	provider, err := s.newProvider(s.cfg.Endpoint, s.cfg.Model)
 	if err != nil {
 		return "", fmt.Errorf("create provider: %w", err)
 	}

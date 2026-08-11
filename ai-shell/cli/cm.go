@@ -8,7 +8,7 @@ import (
 
 	"github.com/pvjammer/ai-shell-poc/agent"
 	"github.com/pvjammer/ai-shell-poc/config"
-	"github.com/pvjammer/ai-sdk-go/pkg/llm"
+	"github.com/pvjammer/ai-shell-poc/llmprovider"
 )
 
 // runCm implements `baish cm` — generate a commit message from staged changes.
@@ -31,8 +31,10 @@ func runCm(args []string) error {
 	appCfg, _ := config.Load()
 	model := envOr("AI_SHELL_MODEL", "llama3.2")
 	endpoint := envOr("AI_SHELL_ENDPOINT", "http://localhost:11434")
+	providerKind := envOr("AI_SHELL_PROVIDER", "ollama")
+	apiKey := envOr("AI_SHELL_API_KEY", "")
 
-	provider, err := llm.NewOllamaProvider(endpoint, model)
+	provider, err := llmprovider.New(providerKind, endpoint, model, apiKey)
 	if err != nil {
 		return fmt.Errorf("cm: create provider: %w", err)
 	}

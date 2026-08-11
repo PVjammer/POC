@@ -15,6 +15,7 @@ type AgentConfig struct {
 	Description            string   `toml:"description"`
 	Model                  string   `toml:"model"`
 	Endpoint               string   `toml:"endpoint"`
+	Provider               string   `toml:"provider"` // "ollama" | "openai"; empty = inherit shell default
 	Tools                  []string `toml:"tools"`           // nil = all act tools; named agents: nil = none
 	Skills                 []string `toml:"skills"`          // nil = all (default agent); named agents: nil = none
 	ExcludedSkills         []string `toml:"excluded_skills"` // subtractive; only meaningful for default agent
